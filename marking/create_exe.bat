@@ -1,0 +1,1 @@
+%~dp0venv\Scripts\python.exe %~dp0venv\Scripts\pyinstaller.exe --add-data "add.png;." --add-data "apply.png;." --add-data "cancel.png;." --add-data "cursor.png;." --add-data "delete.png;." --add-data "edit.png;." --add-data "move.png;." --add-data "reset.png;." --add-data "save.png;." --add-data "search.png;." --name marking main.py 
