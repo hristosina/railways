@@ -9,6 +9,7 @@ import yaml
 import torch
 import traceback
 import multiprocessing as mp
+from training_progress import calculate_training_progress
 
 
 def model_autolabel_process(
@@ -135,22 +136,46 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
         device - на каком устройстве обучение
         """
 
+        progress_state = {"epoch_index": None, "batch_number": 0, "last_payload": None}
+
         def on_train_batch_end(trainer):
-            epoch = trainer.epoch + 1
-            epochs_total = trainer.args.epochs
+            epoch_index = int(trainer.epoch)
+            if progress_state["epoch_index"] != epoch_index:
+                progress_state["epoch_index"] = epoch_index
+                progress_state["batch_number"] = 0
+            progress_state["batch_number"] += 1
 
-            # примерный процент
-            percent_in_epoch = int((epoch / epochs_total) * 100)
+            total_batches = len(trainer.train_loader)
+            epochs_total = int(getattr(trainer, "epochs", trainer.args.epochs))
+            epoch, percent_in_epoch, overall_percent = calculate_training_progress(
+                epoch_index,
+                progress_state["batch_number"],
+                total_batches,
+                epochs_total,
+            )
+            using_gpu = getattr(trainer.device, "type", "cpu") != "cpu"
+            if using_gpu:
+                try:
+                    gpu_mem = float(trainer._get_memory())
+                except (AttributeError, TypeError, ValueError):
+                    gpu_mem = float(torch.cuda.memory_reserved() / (1024 ** 3))
+            else:
+                gpu_mem = 0.0
 
-            gpu_mem = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
-
-            queue.put((
+            payload = (
                 "train_info",
                 epoch,
                 epochs_total,
                 percent_in_epoch,
-                gpu_mem
-            ))
+                overall_percent,
+                gpu_mem,
+                using_gpu,
+            )
+            if payload == progress_state["last_payload"]:
+                return
+            progress_state["last_payload"] = payload
+
+            queue.put(payload)
 
         model.add_callback("on_train_batch_end", on_train_batch_end)
 
@@ -170,8 +195,9 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
 
     except Exception as e:
         queue.put((
-            "log",
-            f"Ошибка при обучении: {str(e)}\n{traceback.format_exc()}"
+            "error",
+            f"Ошибка при обучении: {str(e)}",
+            traceback.format_exc(),
         ))
 
     finally:

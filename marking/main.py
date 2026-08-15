@@ -665,6 +665,7 @@ class MainWindow(QMainWindow):
         self.item = None
         self.current_label_path = None
         self.yoloWorker = None
+        self.active_process_kind = None
         self.annotation_clipboard = []
 
         self.timer = QTimer()
@@ -1881,25 +1882,39 @@ class MainWindow(QMainWindow):
             conf=conf
         )
 
+        self.active_process_kind = "autolabel"
         self.timer.start(100)
 
-    def show_train_info(self, epoch, epochs_total, percent_in_epoch, gpu_mem):
+    def show_train_info(
+        self, epoch, epochs_total, percent_in_epoch,
+        overall_percent, gpu_mem, using_gpu
+    ):
         self.ui.label_epoch_number_value.setText(f"{epoch}/{epochs_total}")
-        # self.ui.label_gpu_mem_value.setText(f"{gpu_mem:.1f} MB")
-        # self.ui.label_progress_value.setText(f"{percent_in_epoch} %")
+        self.ui.label_gpu_mem_value.setText(
+            f"{gpu_mem:.2f} ГБ" if using_gpu else "Не используется"
+        )
+        self.ui.label_progress_value.setText(f"{percent_in_epoch} %")
+        self.ui.progressBar_training.setValue(overall_percent)
 
-        overall_percent = int((epoch / epochs_total) * 100)
-        self.ui.progressBar_training.setValue(int(overall_percent))
-
-    def stop_training(self):
+    def stop_training(self, completed=False):
         self.timer.stop()
 
         if self.yoloWorker.process and self.yoloWorker.process.is_alive():
-            self.yoloWorker.process.terminate()
-            self.yoloWorker.process.join(timeout=5)
+            self.yoloWorker.process.join(timeout=2 if completed else 0)
+            if self.yoloWorker.process.is_alive() and not completed:
+                self.yoloWorker.process.terminate()
+                self.yoloWorker.process.join(timeout=5)
 
-        self.ui.progressBar_training.setVisible(False)
-        self.ui.progressBar_autolabling.setVisible(False)
+        if self.active_process_kind == "training":
+            self.ui.pushButton_start_training.setEnabled(True)
+            if completed:
+                self.ui.progressBar_training.setValue(100)
+                self.ui.label_progress_value.setText("100 %")
+            else:
+                self.ui.progressBar_training.setVisible(False)
+        elif self.active_process_kind == "autolabel":
+            self.ui.progressBar_autolabling.setVisible(False)
+        self.active_process_kind = None
 
     def poll_queue(self):
         if not self.yoloWorker or not self.yoloWorker.queue:
@@ -1912,13 +1927,20 @@ class MainWindow(QMainWindow):
                 break  # очередь пуста — выходим из цикла
 
             if msg[0] == "train_info":
-                _, epoch, epochs_total, percent, gpu_mem = msg
-                self.show_train_info(epoch, epochs_total, percent, gpu_mem)
+                (
+                    _, epoch, epochs_total, percent, overall_percent,
+                    gpu_mem, using_gpu
+                ) = msg
+                self.show_train_info(
+                    epoch, epochs_total, percent,
+                    overall_percent, gpu_mem, using_gpu
+                )
 
             elif msg[0] == "error":
                 _, err, tb = msg
-                self.autolabling_log(err)
-                self.autolabling_log(tb)
+                QMessageBox.critical(
+                    self, "Ошибка фонового процесса", f"{err}\n\n{tb}"
+                )
                 self.stop_training()
 
             elif msg[0] == "log":
@@ -1930,26 +1952,47 @@ class MainWindow(QMainWindow):
                 self.ui.progressBar_autolabling.setValue(percent)
 
             elif msg[0] == "finished":
-                self.stop_training()
+                self.stop_training(completed=True)
 
     def start_training(self):
-        model_path = self.ui.lineEdit_model_path.text()
+        model_path = self.ui.lineEdit_model_path.text().strip()
         if not os.path.exists(model_path):
+            QMessageBox.warning(
+                self, "Не выбрана модель",
+                "Выберите файл начальной модели детекции."
+            )
             return
 
-        yaml_path = self.ui.lineEdit_yaml_path.text()
+        yaml_path = self.ui.lineEdit_yaml_path.text().strip()
         if not os.path.exists(yaml_path):
+            QMessageBox.warning(
+                self, "Не найден data.yaml",
+                "Выберите файл конфигурации обучающего датасета."
+            )
             return
 
         self.yoloWorker = ModelWorker(model_path)
 
+        epochs = self.ui.spinBox_epochs.value()
+        using_gpu = self.ui.checkBox_gpu.isChecked()
+        self.ui.label_epoch_number.setEnabled(True)
+        self.ui.label_epoch_number_value.setEnabled(True)
+        self.ui.label_gpu_mem.setEnabled(True)
+        self.ui.label_gpu_mem_value.setEnabled(True)
+        self.ui.label_progress.setEnabled(True)
+        self.ui.label_progress_value.setEnabled(True)
+        self.ui.label_epoch_number_value.setText(f"0/{epochs}")
+        self.ui.label_gpu_mem_value.setText("Ожидание..." if using_gpu else "Не используется")
+        self.ui.label_progress_value.setText("0 %")
         self.ui.progressBar_training.setValue(0)
         self.ui.progressBar_training.setVisible(True)
+        self.ui.pushButton_start_training.setEnabled(False)
+        self.active_process_kind = "training"
 
         self.yoloWorker.start_training(
             model_path=model_path,
             dataset_yaml=yaml_path,
-            epochs=self.ui.spinBox_epochs.value(),
+            epochs=epochs,
             imgsz=int(self.ui.comboBox.currentText()),
             batch=self.ui.spinBox_batch.value(),
             gpu=self.ui.checkBox_gpu.isChecked()
@@ -2093,6 +2136,10 @@ class ChangeClassCommand(QUndoCommand):
 
 
 if __name__ == '__main__':
+    # Required for multiprocessing workers in a frozen Windows application.
+    # Without this guard PyInstaller starts another copy of the GUI instead of
+    # dispatching the child process to yolo_train_process/autolabel workers.
+    mp.freeze_support()
     if sys.platform == "win32":
         try:
             import ctypes
