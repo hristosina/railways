@@ -16,6 +16,11 @@ from mainwindow import Ui_MainWindow
 from new_class import Ui_Dialog
 from new_class_yaml import Ui_Dialog_new_class_yaml
 from autolabling_dialog import Ui_Dialog_autolabling_settings
+from annotation_utils import (
+    canonical_annotation_lines,
+    merge_annotation_lines,
+    merge_preserving_existing_lines,
+)
 
 from PyQt5.QtCore import QRectF
 
@@ -165,7 +170,9 @@ class BBoxItem(QGraphicsRectItem):
     # Перевод в YOLO формат
     # -----------------------------
     def to_yolo(self):
-        r = self.sceneBoundingRect()
+        # sceneBoundingRect() includes the pen width. Serializing it repeatedly
+        # made copied boxes grow a little on every image.
+        r = self.mapRectToScene(self.rect())
 
         # координаты bbox
         x_c = r.center().x() / self.img_w
@@ -648,6 +655,7 @@ class MainWindow(QMainWindow):
         self.item = None
         self.current_label_path = None
         self.yoloWorker = None
+        self.annotation_clipboard = []
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_queue)
@@ -701,6 +709,15 @@ class MainWindow(QMainWindow):
         # горячая клавиша Delete
         self.shortcut_delete = QShortcut(QKeySequence("Delete"), self)
         self.shortcut_delete.activated.connect(self.ui.toolButton_delete.click)  # вызывает нажатие кнопки
+
+        self.shortcut_copy_annotations = QShortcut(QKeySequence.Copy, self)
+        self.shortcut_copy_annotations.activated.connect(self.copy_active_context)
+        self.shortcut_paste_annotations = QShortcut(QKeySequence.Paste, self)
+        self.shortcut_paste_annotations.activated.connect(self.paste_active_context)
+        self.shortcut_clear_annotations = QShortcut(QKeySequence("Ctrl+D"), self)
+        self.shortcut_clear_annotations.activated.connect(self.clear_current_annotations)
+        self.shortcut_copy_previous = QShortcut(QKeySequence("Ctrl+P"), self)
+        self.shortcut_copy_previous.activated.connect(self.copy_previous_annotations)
 
         self.ui.toolButton_edit.clicked.connect(self.edit_selected_boxes)
         # горячая клавиша Ctrl+E
@@ -780,11 +797,17 @@ class MainWindow(QMainWindow):
         self.ui.toolButton_more.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.ui.toolButton_more.setPopupMode(QtWidgets.QToolButton.DelayedPopup)
         self.action_copy_previous = menu.addAction(
-            QIcon(icon_path("copy.png")), "Скопировать разметку с предыдущего файла"
+            QIcon(icon_path("copy.png")), "Добавить разметку предыдущего файла (Ctrl+P)"
         )
         self.action_copy_previous.triggered.connect(self.copy_previous_annotations)
+        self.action_apply_selected_folder = menu.addAction(
+            QIcon(icon_path("apply.png")), "Применить выделенные рамки ко всей папке"
+        )
+        self.action_apply_selected_folder.triggered.connect(
+            self.apply_selected_annotations_to_folder
+        )
         self.action_clear_annotations = menu.addAction(
-            QIcon(icon_path("delete_all.png")), "Удалить всю разметку текущего файла"
+            QIcon(icon_path("delete_all.png")), "Удалить всю разметку текущего файла (Ctrl+D)"
         )
         self.action_clear_annotations.triggered.connect(self.clear_current_annotations)
         menu.addSeparator()
@@ -815,6 +838,7 @@ class MainWindow(QMainWindow):
         self.ui.toolButton_next.setEnabled(has_next)
         if hasattr(self, "action_copy_previous"):
             self.action_copy_previous.setEnabled(has_previous)
+            self.action_apply_selected_folder.setEnabled(enabled)
             self.action_clear_annotations.setEnabled(enabled)
             self.action_reset_annotations.setEnabled(enabled)
 
@@ -887,6 +911,20 @@ class MainWindow(QMainWindow):
                 item.set_interactive(enabled)
 
     def eventFilter(self, source, event):
+        if (
+            source is self.ui.graphicsView.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+            and event.modifiers() & Qt.ShiftModifier
+        ):
+            item = self.ui.graphicsView.itemAt(event.pos())
+            while item is not None and not isinstance(item, BBoxItem):
+                item = item.parentItem()
+            if isinstance(item, BBoxItem):
+                item.setSelected(not item.isSelected())
+                event.accept()
+                return True
+
         if source is self.ui.graphicsView.viewport() and event.type() == QEvent.Wheel:
 
             # CTRL или включена кнопка зума → масштаб
@@ -1363,7 +1401,7 @@ class MainWindow(QMainWindow):
             if isinstance(item, BBoxItem)
         )
 
-    def set_current_annotation_lines(self, lines):
+    def set_current_annotation_lines(self, lines, selected_from=None):
         if not self.scene or not self.item:
             return
         for item in list(self.scene.items()):
@@ -1373,7 +1411,7 @@ class MainWindow(QMainWindow):
 
         pixmap = self.item.pixmap()
         img_w, img_h = pixmap.width(), pixmap.height()
-        for line in lines:
+        for line_index, line in enumerate(lines):
             parts = line.strip().split()
             if len(parts) != 5:
                 continue
@@ -1393,8 +1431,140 @@ class MainWindow(QMainWindow):
             bbox = BBoxItem(rect, cls, img_w, img_h, color, class_name)
             self.scene.addItem(bbox)
             self.box_items.append(bbox)
+            if selected_from is not None and line_index >= selected_from:
+                bbox.setSelected(True)
+
+    def copy_selected_annotations(self):
+        if not self.scene:
+            return
+        try:
+            selected = [
+                item.to_yolo() for item in self.scene.selectedItems()
+                if isinstance(item, BBoxItem)
+            ]
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            QMessageBox.critical(
+                self, "Ошибка копирования",
+                f"Не удалось скопировать выбранные рамки:\n{exc}"
+            )
+            return
+        self.annotation_clipboard = canonical_annotation_lines(selected)
+        if self.annotation_clipboard:
+            self.statusBar().showMessage(
+                f"Скопировано рамок: {len(self.annotation_clipboard)}", 3000
+            )
+        else:
+            self.statusBar().showMessage("Сначала выделите рамки для копирования", 3000)
+
+    def copy_active_context(self):
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
+            focused.copy()
+        elif self.ui.stackedWidget.currentIndex() == 2:
+            self.copy_selected_annotations()
+
+    def paste_annotations(self):
+        if not self.scene or not self.item:
+            return
+        if not self.annotation_clipboard:
+            self.statusBar().showMessage("Буфер разметки пуст", 3000)
+            return
+        self.undo_stack.push(
+            AppendAnnotationsCommand(
+                self,
+                self.current_annotation_lines(),
+                self.annotation_clipboard,
+                "Paste annotations",
+            )
+        )
+        self.statusBar().showMessage(
+            f"Вставлено рамок: {len(self.annotation_clipboard)}", 3000
+        )
+
+    def paste_active_context(self):
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
+            focused.paste()
+        elif self.ui.stackedWidget.currentIndex() == 2:
+            self.paste_annotations()
+
+    def apply_selected_annotations_to_folder(self):
+        if self.ui.stackedWidget.currentIndex() != 2 or not self.scene:
+            return
+        selected_lines = canonical_annotation_lines(
+            item.to_yolo() for item in self.scene.selectedItems()
+            if isinstance(item, BBoxItem)
+        )
+        if not selected_lines:
+            QMessageBox.information(
+                self, "Нет выделенных рамок",
+                "Выделите одну или несколько рамок, которые нужно применить ко всей папке."
+            )
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Применить ко всей папке")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setText(
+            f"Добавить выделенные рамки ({len(selected_lines)}) ко всем изображениям "
+            f"текущей папки ({len(self.image_items)})?\n\n"
+            "Существующая разметка сохранится, точные дубликаты добавлены не будут."
+        )
+        apply_button = dialog.addButton("Применить", QMessageBox.AcceptRole)
+        cancel_button = dialog.addButton("Отмена", QMessageBox.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.exec_()
+        if dialog.clickedButton() is not apply_button:
+            return
+
+        self.save_current_labels()
+        planned_updates = []
+        try:
+            for _, label_path in self.image_items:
+                existing_lines = []
+                if os.path.isfile(label_path):
+                    with open(label_path, "r", encoding="utf-8") as label_file:
+                        existing_lines = [line.rstrip("\r\n") for line in label_file]
+                merged_lines = merge_preserving_existing_lines(
+                    existing_lines, selected_lines
+                )
+                if merged_lines != [line.strip() for line in existing_lines if line.strip()]:
+                    planned_updates.append((label_path, merged_lines))
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Ошибка чтения разметки",
+                f"Изменения не применены:\n{exc}"
+            )
+            return
+
+        updated = 0
+        try:
+            for label_path, merged_lines in planned_updates:
+                os.makedirs(os.path.dirname(label_path), exist_ok=True)
+                temporary_path = f"{label_path}.marking.tmp"
+                with open(temporary_path, "w", encoding="utf-8") as label_file:
+                    label_file.write("\n".join(merged_lines))
+                os.replace(temporary_path, label_path)
+                updated += 1
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Ошибка записи разметки",
+                f"Обновлено файлов: {updated} из {len(planned_updates)}.\nОшибка:\n{exc}"
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"Выделенные рамки добавлены в файлы: {updated}", 5000
+        )
+        QMessageBox.information(
+            self, "Готово",
+            f"Обновлено файлов разметки: {updated}.\n"
+            f"Без изменений: {len(self.image_items) - updated}."
+        )
 
     def copy_previous_annotations(self):
+        if self.ui.stackedWidget.currentIndex() != 2:
+            return
         if not self.image_items or self.current_index <= 0:
             QMessageBox.information(
                 self, "Нет предыдущего файла", "Для первого изображения предыдущего файла нет."
@@ -1407,29 +1577,35 @@ class MainWindow(QMainWindow):
             )
             return
         with open(previous_label_path, "r", encoding="utf-8") as label_file:
-            new_lines = [line.strip() for line in label_file if line.strip()]
-        self.undo_stack.clear()
+            previous_lines = [line.strip() for line in label_file if line.strip()]
+        current_lines = self.current_annotation_lines()
+        merged_lines = merge_annotation_lines(current_lines, previous_lines)
+        if merged_lines == canonical_annotation_lines(current_lines):
+            self.statusBar().showMessage("Новых рамок в предыдущем файле нет", 3000)
+            return
         self.undo_stack.push(
             ReplaceAnnotationsCommand(
                 self,
-                self.current_annotation_lines(),
-                new_lines,
-                "Copy previous annotations",
+                current_lines,
+                merged_lines,
+                "Merge previous annotations",
             )
         )
 
     def clear_current_annotations(self):
+        if self.ui.stackedWidget.currentIndex() != 2:
+            return
         if not self.current_annotation_lines():
             return
-        reply = QMessageBox.question(
-            self,
-            "Удалить всю разметку",
-            "Удалить все рамки с текущего изображения?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self.undo_stack.clear()
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Удалить всю разметку")
+        dialog.setText("Удалить все рамки с текущего изображения?")
+        dialog.setIcon(QMessageBox.Question)
+        yes_button = dialog.addButton("Да", QMessageBox.YesRole)
+        dialog.addButton("Нет", QMessageBox.NoRole)
+        dialog.setDefaultButton(yes_button)
+        dialog.exec_()
+        if dialog.clickedButton() is yes_button:
             self.undo_stack.push(
                 ReplaceAnnotationsCommand(
                     self,
@@ -1849,6 +2025,23 @@ class ReplaceAnnotationsCommand(QUndoCommand):
 
     def redo(self):
         self.window.set_current_annotation_lines(self.new_lines)
+
+    def undo(self):
+        self.window.set_current_annotation_lines(self.old_lines)
+
+
+class AppendAnnotationsCommand(QUndoCommand):
+    def __init__(self, window, old_lines, appended_lines, description):
+        super().__init__(description)
+        self.window = window
+        self.old_lines = canonical_annotation_lines(old_lines)
+        self.appended_lines = canonical_annotation_lines(appended_lines)
+        self.new_lines = self.old_lines + self.appended_lines
+
+    def redo(self):
+        self.window.set_current_annotation_lines(
+            self.new_lines, selected_from=len(self.old_lines)
+        )
 
     def undo(self):
         self.window.set_current_annotation_lines(self.old_lines)
