@@ -1,6 +1,8 @@
+import html
 import os
 import queue
 import sys
+import textwrap
 
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt, QEvent, QAbstractTableModel, QModelIndex, QThread, QTimer
@@ -9,7 +11,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog,
     QGraphicsScene, QGraphicsView, QButtonGroup, QGraphicsTextItem, QGraphicsRectItem, QGraphicsItem, QShortcut, \
     QDialog, QUndoStack, QUndoCommand, QAbstractItemView, QStyledItemDelegate, QComboBox
 
-from backend import DatasetEditor, YoloWorker
+from backend import DatasetEditor, ModelWorker
 from mainwindow import Ui_MainWindow
 from new_class import Ui_Dialog
 from new_class_yaml import Ui_Dialog_new_class_yaml
@@ -20,9 +22,14 @@ from PyQt5.QtCore import QRectF
 import yaml
 import random
 import multiprocessing as mp
-from ultralytics import YOLO
-
 from modelTest import YOLOTestWorker
+from dataset_utils import (
+    IMAGE_EXTENSIONS,
+    find_annotation_sets,
+    find_dataset_yaml,
+    normalize_dataset_path,
+    resolve_annotation_set,
+)
 
 def resource_path(relative_path):
     """ Получить путь к ресурсам, как при
@@ -32,6 +39,9 @@ def resource_path(relative_path):
     except Exception: # В случае разработки
         base_path = os.path.dirname(__file__)
     return os.path.join(base_path, relative_path)
+
+def icon_path(filename):
+    return resource_path(os.path.join("assets", "icons", filename))
 
 class HandleItem(QGraphicsRectItem):
     def __init__(self, parent_bbox, position_flag):
@@ -586,17 +596,47 @@ class MainWindow(QMainWindow):
         self.delegate = None
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.setWindowIcon(QIcon(icon_path("railway.png")))
 
-        self.ui.toolButton_reset.setIcon(QIcon(resource_path("reset.png")))
-        self.ui.toolButton_edit.setIcon(QIcon(resource_path("edit.png")))
-        self.ui.toolButton_add.setIcon(QIcon(resource_path("add.png")))
-        self.ui.toolButton_delete.setIcon(QIcon(resource_path("delete.png")))
-        self.ui.toolButton_cancel.setIcon(QIcon(resource_path("cancel.png")))
-        self.ui.toolButton_apply.setIcon(QIcon(resource_path("apply.png")))
-        self.ui.toolButton_zoom.setIcon(QIcon(resource_path("search.png")))
-        self.ui.toolButton_cursor.setIcon(QIcon(resource_path("cursor.png")))
-        self.ui.toolButton_move.setIcon(QIcon(resource_path("move.png")))
-        self.ui.toolButton_save.setIcon(QIcon(resource_path("save.png")))
+        self.ui.toolButton_reset.setIcon(QIcon(icon_path("reset.png")))
+        self.ui.toolButton_edit.setIcon(QIcon(icon_path("edit.png")))
+        self.ui.toolButton_add.setIcon(QIcon(icon_path("add.png")))
+        self.ui.toolButton_delete.setIcon(QIcon(icon_path("delete.png")))
+        self.ui.toolButton_cancel.setIcon(QIcon(icon_path("cancel.png")))
+        self.ui.toolButton_apply.setIcon(QIcon(icon_path("apply.png")))
+        self.ui.toolButton_zoom.setIcon(QIcon(icon_path("search.png")))
+        self.ui.toolButton_cursor.setIcon(QIcon(icon_path("cursor.png")))
+        self.ui.toolButton_move.setIcon(QIcon(icon_path("move.png")))
+        self.ui.toolButton_save.setIcon(QIcon(icon_path("save.png")))
+        self.ui.pushButton_copy_previous.setIcon(QIcon(icon_path("copy.png")))
+        self.ui.pushButton_clear_annotations.setIcon(QIcon(icon_path("delete_all.png")))
+        self.ui.toolButton_more.setIcon(QIcon(icon_path("other.png")))
+        self.ui.toolButton_more.setIconSize(QtCore.QSize(25, 25))
+        self.ui.pushButton_model_path.setIcon(QIcon(icon_path("search.png")))
+        self.ui.pushButton_dataset_path.setIcon(QIcon(icon_path("search.png")))
+        self.ui.pushButton_yaml_path.setIcon(QIcon(icon_path("search.png")))
+        self.ui.toolButton_add_class.setIcon(QIcon(icon_path("add.png")))
+        self.ui.toolButton_delete_class.setIcon(QIcon(icon_path("delete.png")))
+        self.ui.toolButton_reset_class_info.setIcon(QIcon(icon_path("reset.png")))
+
+        self.ui.treeWidget_menu.setTextElideMode(Qt.ElideNone)
+        self.ui.treeWidget_menu.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.ui.treeWidget_menu.header().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        self.ui.lineEdit_dataset_path.setPlaceholderText("Корень датасета или папка images")
+        self.ui.lineEdit_yaml_path.setPlaceholderText("Обычно находится автоматически")
+        self.ui.lineEdit_model_path.setPlaceholderText("Для ручной разметки оставьте пустым")
+        self.ui.label_source_hint.setStyleSheet(
+            "QLabel { background: #eef6ff; border: 1px solid #b8d8f8; "
+            "border-radius: 4px; padding: 6px; color: #17324d; }"
+        )
+        self.ui.pushButton_load_mark_info.setText("Открыть датасет для разметки")
+        self.ui.pushButton_load_mark_info.setToolTip(
+            "Загрузить изображения и классы. Файл модели для этого не требуется."
+        )
+        self.ui.pushButton_autolabling.setText("Авторазметка с помощью модели")
+        self.ui.pushButton_autolabling.setToolTip(
+            "Автоматически создать рамки с помощью выбранной модели детекции"
+        )
 
         self.image_items = []  # [(img_path, label_path), ...]
         self.current_index = 0
@@ -605,6 +645,9 @@ class MainWindow(QMainWindow):
         self.class_names = []
         self.class_colors = {}
         self.scene = None
+        self.item = None
+        self.current_label_path = None
+        self.yoloWorker = None
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_queue)
@@ -618,16 +661,21 @@ class MainWindow(QMainWindow):
 
         self.ui.progressBar_autolabling.setVisible(False)
 
-        self.ui.stackedWidget.setCurrentIndex(0)
+        self.ui.stackedWidget.setCurrentIndex(2)
 
         self.ui.treeWidget_menu.expandAll()
-        self.ui.treeWidget_menu.setCurrentItem(self.ui.treeWidget_menu.topLevelItem(0).child(0))
+        self.ui.treeWidget_menu.setCurrentItem(self.ui.treeWidget_menu.topLevelItem(1).child(0))
         self.ui.treeWidget_menu.itemClicked.connect(self.on_treeWidget_menu_item_clicked)
+        self.configure_source_panel("marking")
+        QTimer.singleShot(0, self.adjust_menu_width)
 
         self.ui.pushButton_model_path.clicked.connect(self.choose_model_path)
         self.ui.pushButton_dataset_path.clicked.connect(self.choose_dataset_path)
         self.ui.pushButton_yaml_path.clicked.connect(self.choose_yaml_path)
         self.ui.pushButton_load_mark_info.clicked.connect(self.load_mark_info)
+        self.ui.pushButton_copy_previous.clicked.connect(self.copy_previous_annotations)
+        self.ui.pushButton_clear_annotations.clicked.connect(self.clear_current_annotations)
+        self.setup_more_actions_menu()
 
         self.cursor_group = QButtonGroup(self)
         self.cursor_group.setExclusive(True)  # только одна кнопка может быть нажата
@@ -666,6 +714,10 @@ class MainWindow(QMainWindow):
 
         self.ui.toolButton_cancel.clicked.connect(self.undo_stack.undo)
         self.ui.toolButton_apply.clicked.connect(self.undo_stack.redo)
+        self.ui.toolButton_cancel.setEnabled(False)
+        self.ui.toolButton_apply.setEnabled(False)
+        self.undo_stack.canUndoChanged.connect(self.ui.toolButton_cancel.setEnabled)
+        self.undo_stack.canRedoChanged.connect(self.ui.toolButton_apply.setEnabled)
         QShortcut(QKeySequence.Undo, self, self.undo_stack.undo)
         QShortcut(QKeySequence.Redo, self, self.undo_stack.redo)
 
@@ -697,10 +749,120 @@ class MainWindow(QMainWindow):
 
         self.ui.pushButton_start_model_test.clicked.connect(self.start_model_test)
         self.ui.progressBar_testing.setVisible(False)
+        self.set_annotation_controls_enabled(False)
+        self.wrap_all_tooltips()
 
 
     def get_existing_classes(self):
         return [row.original_name for row in self.classes_model.rows]
+
+    def adjust_menu_width(self):
+        """Fit the menu to its longest item without clipping its text."""
+        self.ui.treeWidget_menu.resizeColumnToContents(0)
+        width = max(340, self.ui.treeWidget_menu.sizeHintForColumn(0) + 48)
+        self.ui.treeWidget_menu.setMinimumWidth(width)
+        self.ui.treeWidget_menu.setMaximumWidth(width)
+
+    @staticmethod
+    def wrapped_tooltip(text, width=58):
+        if not text or text.lstrip().startswith("<"):
+            return text
+        lines = textwrap.wrap(text, width=width, break_long_words=False)
+        return "<qt>" + "<br>".join(html.escape(line) for line in lines) + "</qt>"
+
+    def wrap_all_tooltips(self):
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if widget.toolTip():
+                widget.setToolTip(self.wrapped_tooltip(widget.toolTip()))
+
+    def setup_more_actions_menu(self):
+        menu = QtWidgets.QMenu(self.ui.toolButton_more)
+        self.ui.toolButton_more.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.ui.toolButton_more.setPopupMode(QtWidgets.QToolButton.DelayedPopup)
+        self.action_copy_previous = menu.addAction(
+            QIcon(icon_path("copy.png")), "Скопировать разметку с предыдущего файла"
+        )
+        self.action_copy_previous.triggered.connect(self.copy_previous_annotations)
+        self.action_clear_annotations = menu.addAction(
+            QIcon(icon_path("delete_all.png")), "Удалить всю разметку текущего файла"
+        )
+        self.action_clear_annotations.triggered.connect(self.clear_current_annotations)
+        menu.addSeparator()
+        self.action_reset_annotations = menu.addAction(
+            QIcon(icon_path("reset.png")), "Вернуть разметку к сохранённой версии"
+        )
+        self.action_reset_annotations.triggered.connect(self.reset_current_labels)
+        self.more_actions_menu = menu
+        self.ui.toolButton_more.clicked.connect(self.show_more_actions_menu)
+
+    def show_more_actions_menu(self):
+        """Open the extra-actions menu without Qt's overlaid arrow indicator."""
+        button = self.ui.toolButton_more
+        position = button.mapToGlobal(QtCore.QPoint(0, button.height()))
+        self.more_actions_menu.exec_(position)
+
+    def set_annotation_controls_enabled(self, enabled):
+        for widget in (
+            self.ui.toolButton_edit, self.ui.toolButton_add,
+            self.ui.toolButton_delete, self.ui.toolButton_zoom,
+            self.ui.toolButton_cursor, self.ui.toolButton_move,
+            self.ui.toolButton_save, self.ui.toolButton_more,
+        ):
+            widget.setEnabled(enabled)
+        has_previous = enabled and self.current_index > 0
+        has_next = enabled and self.current_index + 1 < len(self.image_items)
+        self.ui.toolButton_prev.setEnabled(has_previous)
+        self.ui.toolButton_next.setEnabled(has_next)
+        if hasattr(self, "action_copy_previous"):
+            self.action_copy_previous.setEnabled(has_previous)
+            self.action_clear_annotations.setEnabled(enabled)
+            self.action_reset_annotations.setEnabled(enabled)
+
+    def configure_source_panel(self, section):
+        """Show only inputs needed by the selected workflow."""
+        model_widgets = (
+            self.ui.label_model_path,
+            self.ui.lineEdit_model_path,
+            self.ui.pushButton_model_path,
+        )
+        yaml_widgets = (
+            self.ui.label_yaml_path,
+            self.ui.lineEdit_yaml_path,
+            self.ui.pushButton_yaml_path,
+        )
+        show_model = section in ("training", "testing")
+        show_yaml = section != "marking"
+        for widget in model_widgets:
+            widget.setVisible(show_model)
+            widget.setEnabled(show_model)
+        for widget in yaml_widgets:
+            widget.setVisible(show_yaml)
+            widget.setEnabled(show_yaml)
+
+        if section == "marking":
+            self.ui.groupBox_src_files.setTitle("Данные для разметки")
+            self.ui.label_source_hint.setText(
+                "Выберите папку датасета. data.yaml определится автоматически."
+            )
+        elif section == "training":
+            self.ui.groupBox_src_files.setTitle("Данные для обучения")
+            self.ui.label_model_path.setText("Начальная модель детекции:")
+            self.ui.lineEdit_model_path.setPlaceholderText("Например, yolov12n.pt")
+            self.ui.label_source_hint.setText(
+                "Для обучения укажите начальную модель, корень датасета и data.yaml."
+            )
+        elif section == "testing":
+            self.ui.groupBox_src_files.setTitle("Данные для тестирования")
+            self.ui.label_model_path.setText("Обученная модель детекции:")
+            self.ui.lineEdit_model_path.setPlaceholderText("Модель, качество которой нужно оценить")
+            self.ui.label_source_hint.setText(
+                "Для тестирования выберите обученную модель, папку тестовых сценариев и data.yaml."
+            )
+        else:
+            self.ui.groupBox_src_files.setTitle("Данные для редактирования классов")
+            self.ui.label_source_hint.setText(
+                "Выберите корень датасета и data.yaml. Модель для изменения классов не требуется."
+            )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)  # стандартная обработка resize
@@ -770,33 +932,40 @@ class MainWindow(QMainWindow):
         self.place_img(img_path, label_path)
 
     def load_dataset(self, folder_path):
-        images_dir = os.path.join(folder_path, "images")
-        labels_dir = os.path.join(folder_path, "labels")
-
-        image_exts = (".jpg", ".jpeg", ".png")
+        try:
+            _, images_dir, labels_dir = resolve_annotation_set(folder_path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Невозможно открыть папку", str(exc))
+            return False
 
         self.image_items.clear()
 
-        for name in sorted(os.listdir(images_dir)):
-            if not name.lower().endswith(image_exts):
+        for name in sorted(os.listdir(str(images_dir))):
+            if os.path.splitext(name)[1].lower() not in IMAGE_EXTENSIONS:
                 continue
 
-            img_path = os.path.join(images_dir, name)
+            img_path = os.path.join(str(images_dir), name)
             label_path = os.path.join(
-                labels_dir,
+                str(labels_dir),
                 os.path.splitext(name)[0] + ".txt"
             )
-
-            # label может отсутствовать — это нормально
-            if not os.path.exists(label_path):
-                label_path = None
 
             self.image_items.append((img_path, label_path))
 
         self.img_count = len(self.image_items)
         self.current_index = 0
+        if not self.image_items:
+            self.ui.label_img_num.setText("Изображение 0/0")
+            self.set_annotation_controls_enabled(False)
+            QMessageBox.information(
+                self,
+                "Нет изображений",
+                f"В папке {images_dir} нет поддерживаемых изображений."
+            )
+            return False
         img_path, label_path = self.image_items[self.current_index]
         self.place_img(img_path, label_path)
+        return True
 
     def on_drag_mode_changed(self, button, checked):
         if not checked:
@@ -817,13 +986,17 @@ class MainWindow(QMainWindow):
         img_w = pixmap.width()
         img_h = pixmap.height()
 
-        with open(txt_path, "r") as f:
-            for line in f:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
                 parts = line.strip().split()
                 if len(parts) != 5:
                     continue
 
-                cls, x_c, y_c, w_rel, h_rel = map(float, parts)
+                try:
+                    cls, x_c, y_c, w_rel, h_rel = map(float, parts)
+                except ValueError:
+                    print(f"Пропущена некорректная строка {line_number} в {txt_path}")
+                    continue
                 cls = int(cls)
 
                 x = (x_c - w_rel / 2) * img_w
@@ -836,7 +1009,7 @@ class MainWindow(QMainWindow):
                 color = self.class_colors.get(cls, QColor(255, 0, 0))
                 class_name = (
                     self.class_names[cls]
-                    if cls < len(self.class_names)
+                    if 0 <= cls < len(self.class_names)
                     else f"class {cls}"
                 )
 
@@ -854,10 +1027,17 @@ class MainWindow(QMainWindow):
             self.view.setScene(self.scene)
             self.scene.undo_stack = self.undo_stack
 
+        self.undo_stack.clear()
         self.scene.clear()
         self.box_items.clear()
 
         pixmap = QPixmap(img_path)
+        if pixmap.isNull():
+            self.set_annotation_controls_enabled(False)
+            QMessageBox.critical(
+                self, "Ошибка изображения", f"Не удалось открыть изображение:\n{img_path}"
+            )
+            return
         self.item = self.scene.addPixmap(pixmap)
         self.scene.setSceneRect(self.item.boundingRect())
         self.view.resetTransform()
@@ -873,6 +1053,7 @@ class MainWindow(QMainWindow):
                 self.ui.graphicsView.scene().sceneRect(),
                 Qt.KeepAspectRatio
             )
+        self.set_annotation_controls_enabled(True)
 
     def on_treeWidget_menu_item_clicked(self, item, column):
         parent = item.parent()
@@ -881,19 +1062,23 @@ class MainWindow(QMainWindow):
             child_index = parent.indexOfChild(item)
             if (parent_index == 0) and (child_index == 0):
                 self.ui.stackedWidget.setCurrentIndex(0)
+                self.configure_source_panel("training")
             elif (parent_index == 0) and (child_index == 1):
                 self.ui.stackedWidget.setCurrentIndex(1)
+                self.configure_source_panel("testing")
             elif (parent_index == 1) and (child_index == 0):
                 self.ui.stackedWidget.setCurrentIndex(2)
+                self.configure_source_panel("marking")
             elif (parent_index == 1) and (child_index == 1):
                 self.ui.stackedWidget.setCurrentIndex(3)
+                self.configure_source_panel("dataset_edit")
 
     def choose_model_path(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выберите файл",
+            "Выберите модель детекции",
             os.getcwd(),
-            "*.pt"
+            "Модели детекции (*.pt *.onnx *.engine *.torchscript);;Все файлы (*)"
         )
         if file_path:
             self.ui.lineEdit_model_path.setText(file_path)
@@ -901,65 +1086,122 @@ class MainWindow(QMainWindow):
     def choose_dataset_path(self):
         folder_path = (QFileDialog.getExistingDirectory(
             self,
-            "Выберите папку",
+            "Выберите корень датасета, split или папку images",
             os.getcwd()
         ))
         if folder_path:
-            self.ui.lineEdit_dataset_path.setText(folder_path)
+            try:
+                dataset_path = normalize_dataset_path(folder_path)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Неверная папка", str(exc))
+                return
+            self.ui.lineEdit_dataset_path.setText(str(dataset_path))
+            yaml_path = find_dataset_yaml(dataset_path)
+            if yaml_path:
+                self.ui.lineEdit_yaml_path.setText(str(yaml_path))
 
     def choose_yaml_path(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выберите файл",
+            "Выберите data.yaml со списком классов",
             os.getcwd(),
-            "*.yaml"
+            "YAML (*.yaml *.yml)"
         )
         if file_path:
             self.ui.lineEdit_yaml_path.setText(file_path)
 
     def load_mark_info(self):
+        self.save_current_labels()
         self.ui.treeWidget_dir.clear()
 
-        if os.path.exists(self.ui.lineEdit_model_path.text()):
-            model = YOLO(self.ui.lineEdit_model_path.text())
-            print(model.names)
+        dataset_path = self.ui.lineEdit_dataset_path.text().strip()
+        if not dataset_path:
+            QMessageBox.warning(
+                self,
+                "Не выбран датасет",
+                "Нажмите кнопку с лупой рядом с полем «Папка датасета» и выберите корень датасета или папку images."
+            )
+            return
+        try:
+            dataset_path = str(normalize_dataset_path(dataset_path))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Неверный датасет", str(exc))
+            return
 
-        if os.path.exists(self.ui.lineEdit_yaml_path.text()):
-            self.load_classes(self.ui.lineEdit_yaml_path.text())
+        self.ui.lineEdit_dataset_path.setText(dataset_path)
+        yaml_path = self.ui.lineEdit_yaml_path.text().strip()
+        if not os.path.isfile(yaml_path):
+            detected_yaml = find_dataset_yaml(dataset_path)
+            if detected_yaml:
+                yaml_path = str(detected_yaml)
+                self.ui.lineEdit_yaml_path.setText(yaml_path)
+        if not os.path.isfile(yaml_path):
+            yaml_path, _ = QFileDialog.getOpenFileName(
+                self, "Не найден data.yaml — выберите файл со списком классов",
+                dataset_path, "YAML (*.yaml *.yml)"
+            )
+            if not yaml_path:
+                QMessageBox.warning(
+                    self, "Не найден data.yaml",
+                    "Без списка классов датасет открыть нельзя."
+                )
+                return
+            self.ui.lineEdit_yaml_path.setText(yaml_path)
+        try:
+            self.load_classes(yaml_path)
             self.generate_class_colors()
+        except (OSError, yaml.YAMLError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Ошибка YAML", f"Не удалось прочитать классы:\n{exc}")
+            return
 
-        dataset_path = self.ui.lineEdit_dataset_path.text()
-        if os.path.exists(dataset_path):
-            self.fill_treeWidget_dir(dataset_path, self.ui.treeWidget_dir)
-            self.ui.treeWidget_dir.setCurrentItem(self.ui.treeWidget_menu.topLevelItem(0))
+        annotation_sets = self.fill_treeWidget_dir(dataset_path, self.ui.treeWidget_dir)
+        if not annotation_sets:
+            QMessageBox.warning(
+                self,
+                "Не найдены изображения",
+                "В датасете не найдено ни одной пары папок images/labels."
+            )
+            return
+
+        first_item = self.ui.treeWidget_dir.topLevelItem(0)
+        self.ui.treeWidget_dir.setCurrentItem(first_item)
+        self.load_dataset(first_item.data(0, Qt.UserRole))
 
 
     def fill_treeWidget_dir(self, path, parent_item):
-        for item_name in sorted(os.listdir(path)):
-            full_path = os.path.join(path, item_name)
-            if os.path.isdir(full_path):
-                tree_item = QTreeWidgetItem(parent_item, [item_name])
-                self.fill_treeWidget_dir(full_path, tree_item)
+        annotation_sets = find_annotation_sets(path)
+        root = os.path.abspath(path)
+        for annotation_path in annotation_sets:
+            relative_path = os.path.relpath(str(annotation_path), root)
+            display_name = os.path.basename(root) if relative_path == "." else relative_path
+            tree_item = QTreeWidgetItem(parent_item, [display_name])
+            tree_item.setData(0, Qt.UserRole, str(annotation_path))
+        return annotation_sets
 
     def on_treeWidget_dir_item_clicked(self, item, column):
-        parts = []
-        current = item
-        while current:
-            parts.append(current.text(0))
-            current = current.parent()
-        # путь собирается снизу вверх
-        parts.reverse()
-        full_path = os.path.join(*parts)
-        self.load_dataset(self.ui.lineEdit_dataset_path.text() + "/" + full_path)
+        folder_path = item.data(0, Qt.UserRole)
+        if folder_path:
+            self.save_current_labels()
+            self.load_dataset(folder_path)
 
     def load_classes(self, yaml_path):
         with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        self.class_names = data.get("names", [])
+        if not isinstance(data, dict):
+            raise ValueError("YAML должен содержать словарь с полем names.")
+        names = data.get("names", [])
+        if isinstance(names, dict):
+            names = [names[key] for key in sorted(names, key=lambda value: int(value))]
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("Поле names должно быть списком названий классов.")
+        self.class_names = names
 
     def generate_class_colors(self):
         self.class_colors = {}
+
+        if not self.class_names:
+            return
 
         for i, name in enumerate(self.class_names):
             # простая, но стабильная генерация цветов
@@ -1048,6 +1290,9 @@ class MainWindow(QMainWindow):
     def add_new_box(self):
         if not self.scene or not self.item:
             return
+        if not self.class_names:
+            QMessageBox.warning(self, "Нет классов", "Сначала загрузите классы из data.yaml.")
+            return
 
         # 1. Выбор класса
         dialog = NewBoxDialog(self.class_names, 0)
@@ -1106,8 +1351,93 @@ class MainWindow(QMainWindow):
 
         os.makedirs(os.path.dirname(self.current_label_path), exist_ok=True)
 
-        with open(self.current_label_path, "w") as f:
+        with open(self.current_label_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
+
+    def current_annotation_lines(self):
+        if not self.scene:
+            return []
+        return sorted(
+            item.to_yolo()
+            for item in self.scene.items()
+            if isinstance(item, BBoxItem)
+        )
+
+    def set_current_annotation_lines(self, lines):
+        if not self.scene or not self.item:
+            return
+        for item in list(self.scene.items()):
+            if isinstance(item, BBoxItem):
+                self.scene.removeItem(item)
+        self.box_items.clear()
+
+        pixmap = self.item.pixmap()
+        img_w, img_h = pixmap.width(), pixmap.height()
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) != 5:
+                continue
+            try:
+                cls, x_c, y_c, w_rel, h_rel = map(float, parts)
+            except ValueError:
+                continue
+            cls = int(cls)
+            rect = QRectF(
+                (x_c - w_rel / 2) * img_w,
+                (y_c - h_rel / 2) * img_h,
+                w_rel * img_w,
+                h_rel * img_h,
+            )
+            color = self.class_colors.get(cls, QColor(255, 0, 0))
+            class_name = self.class_names[cls] if 0 <= cls < len(self.class_names) else f"class {cls}"
+            bbox = BBoxItem(rect, cls, img_w, img_h, color, class_name)
+            self.scene.addItem(bbox)
+            self.box_items.append(bbox)
+
+    def copy_previous_annotations(self):
+        if not self.image_items or self.current_index <= 0:
+            QMessageBox.information(
+                self, "Нет предыдущего файла", "Для первого изображения предыдущего файла нет."
+            )
+            return
+        previous_label_path = self.image_items[self.current_index - 1][1]
+        if not os.path.isfile(previous_label_path):
+            QMessageBox.information(
+                self, "Нет разметки", "У предыдущего изображения файл разметки отсутствует."
+            )
+            return
+        with open(previous_label_path, "r", encoding="utf-8") as label_file:
+            new_lines = [line.strip() for line in label_file if line.strip()]
+        self.undo_stack.clear()
+        self.undo_stack.push(
+            ReplaceAnnotationsCommand(
+                self,
+                self.current_annotation_lines(),
+                new_lines,
+                "Copy previous annotations",
+            )
+        )
+
+    def clear_current_annotations(self):
+        if not self.current_annotation_lines():
+            return
+        reply = QMessageBox.question(
+            self,
+            "Удалить всю разметку",
+            "Удалить все рамки с текущего изображения?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.undo_stack.clear()
+            self.undo_stack.push(
+                ReplaceAnnotationsCommand(
+                    self,
+                    self.current_annotation_lines(),
+                    [],
+                    "Clear annotations",
+                )
+            )
 
     def reset_current_labels(self):
         if not self.item:
@@ -1313,19 +1643,42 @@ class MainWindow(QMainWindow):
     #         self.thread.start()
 
     def start_autolabling(self):
-        model_path = self.ui.lineEdit_model_path.text()
+        model_path = self.ui.lineEdit_model_path.text().strip()
         root_folder = self.ui.lineEdit_dataset_path.text()
 
-        if not os.path.exists(model_path) or not os.path.exists(root_folder):
+        if not os.path.isfile(model_path):
+            model_path, _ = QFileDialog.getOpenFileName(
+                self, "Выберите модель для авторазметки", os.getcwd(),
+                "Модели детекции (*.pt *.onnx *.engine *.torchscript);;Все файлы (*)"
+            )
+            if not model_path:
+                return
+            self.ui.lineEdit_model_path.setText(model_path)
+        if not os.path.isdir(root_folder):
+            QMessageBox.warning(self, "Не выбран датасет", "Сначала выберите папку датасета.")
             return
+        yaml_path = self.ui.lineEdit_yaml_path.text().strip()
+        if not os.path.isfile(yaml_path):
+            detected_yaml = find_dataset_yaml(root_folder)
+            if detected_yaml:
+                yaml_path = str(detected_yaml)
+                self.ui.lineEdit_yaml_path.setText(yaml_path)
+            else:
+                yaml_path, _ = QFileDialog.getOpenFileName(
+                    self, "Выберите data.yaml со списком классов",
+                    root_folder, "YAML (*.yaml *.yml)"
+                )
+                if not yaml_path:
+                    return
+                self.ui.lineEdit_yaml_path.setText(yaml_path)
 
-        dialog = AutoLabelingDialog(self.ui.lineEdit_yaml_path.text())
+        dialog = AutoLabelingDialog(yaml_path)
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
 
         selected_classes, conf = dialog.get_settings()
 
-        self.yoloWorker = YoloWorker(model_path)
+        self.yoloWorker = ModelWorker(model_path)
 
         self.ui.progressBar_autolabling.setValue(0)
         self.ui.progressBar_autolabling.setVisible(True)
@@ -1397,7 +1750,7 @@ class MainWindow(QMainWindow):
         if not os.path.exists(yaml_path):
             return
 
-        self.yoloWorker = YoloWorker(model_path)
+        self.yoloWorker = ModelWorker(model_path)
 
         self.ui.progressBar_training.setValue(0)
         self.ui.progressBar_training.setVisible(True)
@@ -1487,6 +1840,19 @@ class AddBBoxCommand(QUndoCommand):
     def undo(self):
         self.scene.removeItem(self.bbox)
 
+class ReplaceAnnotationsCommand(QUndoCommand):
+    def __init__(self, window, old_lines, new_lines, description):
+        super().__init__(description)
+        self.window = window
+        self.old_lines = list(old_lines)
+        self.new_lines = list(new_lines)
+
+    def redo(self):
+        self.window.set_current_annotation_lines(self.new_lines)
+
+    def undo(self):
+        self.window.set_current_annotation_lines(self.old_lines)
+
 class RemoveBBoxCommand(QUndoCommand):
     def __init__(self, scene, bbox):
         super().__init__("Remove box")
@@ -1519,8 +1885,18 @@ class ChangeClassCommand(QUndoCommand):
 
 
 if __name__ == '__main__':
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Railways.Marking.Desktop"
+            )
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(icon_path("railway.png")))
     window = MainWindow()
+    window.setWindowIcon(QIcon(icon_path("railway.png")))
     # window.show()
     window.showMaximized()
     sys.exit(app.exec_())

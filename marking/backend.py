@@ -11,7 +11,7 @@ import traceback
 import multiprocessing as mp
 
 
-def yolo_autolabel_process(
+def model_autolabel_process(
     queue,
     model_path,
     root_folder,
@@ -19,10 +19,10 @@ def yolo_autolabel_process(
     conf
 ):
     try:
-        from ultralytics import YOLO
         from pathlib import Path
+        from model_adapters import create_detection_adapter
 
-        model = YOLO(model_path)
+        model = create_detection_adapter(model_path)
 
         root_folder = Path(root_folder)
         image_folders = list(root_folder.rglob("images"))
@@ -61,28 +61,20 @@ def yolo_autolabel_process(
                                     "h": float(p[4]),
                                 })
 
-                results = model.predict(str(img_path), conf=conf, save=False)
-
                 new_labels = []
-                for r in results:
-                    h, w = r.orig_shape[:2]
-                    for box in r.boxes:
-                        cls_idx = int(box.cls[0])
-                        cls_name = model.names[cls_idx]
-
-                        if selected_classes is None or cls_name in selected_classes:
-                            x, y, bw, bh = box.xywh[0]
-                            new_labels.append({
-                                "cls": cls_idx,
-                                "x": float(x / w),
-                                "y": float(y / h),
-                                "w": float(bw / w),
-                                "h": float(bh / h),
-                            })
+                for detection in model.predict(str(img_path), conf):
+                    if selected_classes is None or detection.class_name in selected_classes:
+                        new_labels.append({
+                            "cls": detection.class_id,
+                            "x": detection.x,
+                            "y": detection.y,
+                            "w": detection.width,
+                            "h": detection.height,
+                        })
 
                 final_labels = [
                     lbl for lbl in existing_labels
-                    if model.names[lbl["cls"]] not in (selected_classes or [])
+                    if model.class_names.get(lbl["cls"]) not in (selected_classes or [])
                 ]
                 final_labels.extend(new_labels)
 
@@ -196,7 +188,7 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
             pass
 
 
-class YoloWorker(QObject):
+class ModelWorker(QObject):
     # epoch, epochs_total, percent_in_epoch, gpu_mem
     train_info = pyqtSignal(int, int, int, float)
     progress = pyqtSignal(int)  # процент выполнения
@@ -206,7 +198,7 @@ class YoloWorker(QObject):
     def __init__(self, model_path, parent=None):
         super().__init__(parent)
         self.model_path = model_path
-        self.model = YOLO(model_path)
+        self.model = None
         self.process = None
         self.queue = None
 
@@ -247,7 +239,7 @@ class YoloWorker(QObject):
         self.queue = mp.Queue()
 
         self.process = mp.Process(
-            target=yolo_autolabel_process,
+            target=model_autolabel_process,
             args=(
                 self.queue,
                 model_path,
@@ -266,6 +258,8 @@ class YoloWorker(QObject):
         Сигналы log и train_info обновляются автоматически.
         """
         try:
+            if self.model is None:
+                self.model = YOLO(self.model_path)
             device = 0 if gpu else 'cpu'
 
             """
@@ -437,6 +431,10 @@ class YoloWorker(QObject):
 
         finally:
             self.finished.emit(True)
+
+
+# Compatibility for external code written against the old public name.
+YoloWorker = ModelWorker
 
 
 class DatasetEditor(QObject):
