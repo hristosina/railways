@@ -48,6 +48,17 @@ def resource_path(relative_path):
 def icon_path(filename):
     return resource_path(os.path.join("assets", "icons", filename))
 
+
+def apply_application_style(app):
+    """Load the shared light theme in development and in a PyInstaller build."""
+    app.setStyle("Fusion")
+    stylesheet_path = resource_path(os.path.join("assets", "styles", "light.qss"))
+    try:
+        with open(stylesheet_path, "r", encoding="utf-8") as stylesheet_file:
+            app.setStyleSheet(stylesheet_file.read())
+    except OSError as exc:
+        print(f"Не удалось загрузить тему интерфейса: {exc}")
+
 class HandleItem(QGraphicsRectItem):
     def __init__(self, parent_bbox, position_flag):
         size = 6
@@ -604,6 +615,9 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowIcon(QIcon(icon_path("railway.png")))
+        self.ui.menubar.setVisible(False)
+        self.ui.centralwidget.layout().setContentsMargins(14, 12, 14, 10)
+        self.ui.centralwidget.layout().setHorizontalSpacing(14)
 
         self.ui.toolButton_reset.setIcon(QIcon(icon_path("reset.png")))
         self.ui.toolButton_edit.setIcon(QIcon(icon_path("edit.png")))
@@ -632,10 +646,6 @@ class MainWindow(QMainWindow):
         self.ui.lineEdit_dataset_path.setPlaceholderText("Корень датасета или папка images")
         self.ui.lineEdit_yaml_path.setPlaceholderText("Обычно находится автоматически")
         self.ui.lineEdit_model_path.setPlaceholderText("Для ручной разметки оставьте пустым")
-        self.ui.label_source_hint.setStyleSheet(
-            "QLabel { background: #eef6ff; border: 1px solid #b8d8f8; "
-            "border-radius: 4px; padding: 6px; color: #17324d; }"
-        )
         self.ui.pushButton_load_mark_info.setText("Открыть датасет для разметки")
         self.ui.pushButton_load_mark_info.setToolTip(
             "Загрузить изображения и классы. Файл модели для этого не требуется."
@@ -664,7 +674,7 @@ class MainWindow(QMainWindow):
         self.ui.tableView_class_info
         self.undo_stack = QUndoStack(self)
 
-        self.ui.graphicsView.setBackgroundBrush(Qt.black)
+        self.ui.graphicsView.setBackgroundBrush(QColor("#eef2f7"))
         self.ui.graphicsView.viewport().installEventFilter(self)
 
         self.ui.progressBar_autolabling.setVisible(False)
@@ -672,6 +682,11 @@ class MainWindow(QMainWindow):
         self.ui.stackedWidget.setCurrentIndex(2)
 
         self.ui.treeWidget_menu.expandAll()
+        for item_index in range(self.ui.treeWidget_menu.topLevelItemCount()):
+            item = self.ui.treeWidget_menu.topLevelItem(item_index)
+            item_font = item.font(0)
+            item_font.setBold(True)
+            item.setFont(0, item_font)
         self.ui.treeWidget_menu.setCurrentItem(self.ui.treeWidget_menu.topLevelItem(1).child(0))
         self.ui.treeWidget_menu.itemClicked.connect(self.on_treeWidget_menu_item_clicked)
         self.configure_source_panel("marking")
@@ -776,7 +791,7 @@ class MainWindow(QMainWindow):
     def adjust_menu_width(self):
         """Fit the menu to its longest item without clipping its text."""
         self.ui.treeWidget_menu.resizeColumnToContents(0)
-        width = max(340, self.ui.treeWidget_menu.sizeHintForColumn(0) + 48)
+        width = max(280, self.ui.treeWidget_menu.sizeHintForColumn(0) + 48)
         self.ui.treeWidget_menu.setMinimumWidth(width)
         self.ui.treeWidget_menu.setMaximumWidth(width)
 
@@ -2088,6 +2103,7 @@ if __name__ == '__main__':
             pass
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path("railway.png")))
+    apply_application_style(app)
     window = MainWindow()
     window.setWindowIcon(QIcon(icon_path("railway.png")))
     # window.show()
