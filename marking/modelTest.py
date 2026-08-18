@@ -1,284 +1,199 @@
-import os
-import time
+import queue as queue_module
+import tempfile
 import traceback
 from pathlib import Path
-import pandas as pd
-import matplotlib.pyplot as plt
-import torch
-from PyQt5.QtCore import QObject, pyqtSignal
+
 import multiprocessing as mp
+import torch
+import ultralytics
+import yaml
+from PyQt5.QtCore import QObject, pyqtSignal
 from ultralytics import YOLO
 
+from evaluation_report import (
+    aligned_scenario_view,
+    class_id_mapping,
+    count_images,
+    copy_standard_ultralytics_report,
+    evaluation_progress_percent,
+    extract_evaluation,
+    normalize_class_names,
+    publish_standard_ultralytics_report,
+    write_report,
+)
 
-def create_temp_data_yaml(scenario_dir, class_names, output_root):
-    import yaml
-    from pathlib import Path
 
-    yaml_path = output_root / f"data_{scenario_dir.name}.yaml"
-
+def create_temp_data_yaml(scenario_dir, class_names, output_dir):
+    """Создает data.yaml в автоматически удаляемой временной папке."""
+    yaml_path = Path(output_dir) / f"data_{scenario_dir.name}.yaml"
     data = {
         "path": str(scenario_dir.resolve()),
         "train": "images",
         "val": "images",
         "nc": len(class_names),
-        "names": class_names
+        "names": class_names,
     }
-
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True)
-
+    with open(yaml_path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
     return yaml_path
 
-def yolo_test_process(
-    queue,
-    model_path,
-    test_root,
-    class_names,
-    imgsz,
-    gpu,
-    export_pr=True,        # для построения графика в excel
-    pr_steps=51            # для построения графика в excel
-):
+
+def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, imgsz, gpu):
+    success, report_path = False, ""
     try:
-        # ---------- DEVICE ----------
         if torch.cuda.is_available() and gpu:
             device = 0
-            queue.put(("log", f"GPU доступен: {torch.cuda.get_device_name(device)}"))
+            device_name = torch.cuda.get_device_name(device)
+            queue.put(("log", f"GPU: {device_name}"))
         else:
-            device = "cpu"
+            device, device_name = "cpu", "CPU"
             queue.put(("log", "Используется CPU"))
 
+        if not scenarios:
+            raise ValueError("Не задано ни одного тестового сценария.")
+        scenarios = [(str(name), Path(path).resolve()) for name, path in scenarios]
+        report_dir = Path(report_dir).resolve()
+        standard_report_dir = report_dir / "Стандартный_отчет_Ultralytics"
+        queue.put(("log", f"Найдено сценариев: {len(scenarios)}"))
         model = YOLO(model_path)
-
-        test_root = Path(test_root)
-        output_root = test_root / "_results"
-        output_root.mkdir(exist_ok=True)
-
-        # ---------- ПОИСК СЦЕНАРИЕВ ----------
-        scenarios = []
-
-        for path in test_root.rglob("*"):
-            if not path.is_dir():
-                continue
-
-            images_dir = path / "images"
-            labels_dir = path / "labels"
-
-            if not images_dir.exists():
-                continue
-
-            if not labels_dir.exists():
-                queue.put((
-                    "log",
-                    f"Пропуск сценария {path}: отсутствует папка labels/"
-                ))
-                continue
-
-            scenarios.append(path)
-
-        total_scenarios = len(scenarios)
-        queue.put(("log", f"Найдено сценариев: {total_scenarios}"))
-
-        summary_rows = []
-
-        # ---------- ОСНОВНОЙ ЦИКЛ ----------
-        for idx, scenario_dir in enumerate(scenarios, start=1):
+        model_class_names = normalize_class_names(model.names)
+        mapping = class_id_mapping(class_names, model_class_names)
+        if any(source_id != target_id for source_id, target_id in mapping.items()):
             queue.put((
-                "scenario_info",
-                scenario_dir.name,
-                idx,
-                total_scenarios
+                "log",
+                "Порядок классов data.yaml отличается от порядка классов модели. "
+                "Для тестирования разметка будет временно перенумерована.\n"
+                f"data.yaml: {class_names}\nмодель: {model_class_names}",
             ))
+        scenario_results = []
+        progress_state = {"scenario_index": 0, "last_percent": -1}
 
-            images_dir = scenario_dir / "images"
-            scenario_out = output_root / scenario_dir.name
-            scenario_out.mkdir(exist_ok=True)
-
-            start_time = time.time()
-
-            data_yaml = create_temp_data_yaml(
-                scenario_dir,
-                class_names,
-                output_root
+        def report_batch_progress(validator):
+            """Получает прогресс непосредственно после каждого val-пакета."""
+            percent = evaluation_progress_percent(
+                scenario_index=progress_state["scenario_index"],
+                total_scenarios=len(scenarios),
+                batch_index=validator.batch_i,
+                total_batches=len(validator.dataloader),
             )
+            # Очередь обновляется только при изменении целого процента, чтобы
+            # сотни пакетов не перегружали событийный цикл Qt.
+            if percent != progress_state["last_percent"]:
+                progress_state["last_percent"] = percent
+                queue.put(("progress", percent))
 
-            metrics = model.val(
-                data=str(data_yaml),  # путь к data.yaml для текущего сценария (классы + labels)
-                imgsz=imgsz,  # размер входных изображений (например, 640)
-                device=device,  # GPU или CPU для инференса
-                conf=0.001,  # минимальная уверенность для детекции (очень низкая для теста)
-                iou=0.5,  # IoU threshold для подсчёта mAP@0.5
-                save=False,  # сохранять картинки с боксами? False — нет
-                plots=True,  # строить графики (PR-кривые, confusion matrix)? False — нет
-                verbose=False  # выводить подробный лог в консоль? False — нет
-            )
+        model.add_callback("on_val_batch_end", report_batch_progress)
 
-            elapsed = time.time() - start_time
-
-            # число изображений в текущем сценарии
-            num_images = len(list((scenario_dir / "images").glob("*.*")))
-
-            fps = metrics.speed['inference']  # инференс FPS
-            inf_time = (elapsed / num_images) * 1000  # мс на изображение
-
-            # ---------- PR CURVE EXPORT ----------
-            if export_pr:
-                queue.put(("log", f"PR-sweep для сценария {scenario_dir.name}"))
-
-                import numpy as np
-
-                pr_rows = []
-                conf_list = np.linspace(0.0, 1.0, pr_steps)
-
-                for conf in conf_list:
-                    pr_metrics = model.val(
+        # Даже при save=False Ultralytics создает служебный save_dir. Направляем
+        # его во временную папку, которая удалится после завершения проверки.
+        with tempfile.TemporaryDirectory(prefix="marking_evaluation_") as temp_dir:
+            temp_root = Path(temp_dir)
+            standard_staging_dir = temp_root / "standard_report"
+            for index, (shown_name, scenario_dir) in enumerate(scenarios, start=1):
+                progress_state["scenario_index"] = index - 1
+                queue.put(("scenario_info", shown_name, index, len(scenarios)))
+                queue.put(("log", f"Тестирование: {shown_name} ({index}/{len(scenarios)})"))
+                with aligned_scenario_view(scenario_dir, class_names, model_class_names) as (validation_dir, _mapping):
+                    data_yaml = create_temp_data_yaml(validation_dir, model_class_names, temp_root)
+                    metrics = model.val(
                         data=str(data_yaml),
                         imgsz=imgsz,
                         device=device,
-                        conf=float(conf),
+                        conf=0.001,
                         iou=0.5,
                         save=False,
-                        plots=False,
-                        verbose=False
+                        save_json=False,
+                        plots=True,
+                        project=str(temp_root),
+                        name=f"scenario_{index}",
+                        exist_ok=True,
+                        verbose=False,
                     )
-
-                    # ---------- per-class ----------
-                    for i, cls_name in enumerate(class_names):
-                        pr_rows.append({
-                            "confidence": float(conf),
-                            "class": cls_name,
-                            "precision": float(pr_metrics.box.p[i]),
-                            "recall": float(pr_metrics.box.r[i])
-                        })
-
-                    # ---------- mean ----------
-                    pr_rows.append({
-                        "confidence": float(conf),
-                        "class": "__mean__",
-                        "precision": float(pr_metrics.box.p.mean()),
-                        "recall": float(pr_metrics.box.r.mean())
-                    })
-
-                pr_dir = scenario_out / "pr_curves"
-                pr_dir.mkdir(exist_ok=True)
-
-                df_pr = pd.DataFrame(pr_rows)
-
-                df_pr.to_excel(
-                    pr_dir / "PR_curve_all.xlsx",
-                    index=False
+                validator_output = temp_root / f"scenario_{index}"
+                copy_standard_ultralytics_report(
+                    validator_output, standard_staging_dir, shown_name, index
                 )
-
-            # ---------- GLOBAL METRICS ----------
-            summary_rows.append({
-                "Scenario": scenario_dir.name,
-                "mAP@0.5": metrics.box.map50,
-                "mAP@0.5:0.95": metrics.box.map,
-                "FPS": fps,
-                "InferenceTime(ms/img)": inf_time
-            })
-
-            # ---------- PER-CLASS METRICS ----------
-            rows = []
-            for i, cls in enumerate(class_names):
-                rows.append({
-                    "Class": cls,
-                    "mAP@0.5": metrics.box.maps[i],
-                    "mAP@0.5:0.95": metrics.box.map,
-                    "Precision": metrics.box.p[i],
-                    "Recall": metrics.box.r[i]
+                class_rows, curves = extract_evaluation(metrics, model_class_names)
+                inference_ms = float(metrics.speed.get("inference", 0.0))
+                scenario_results.append({
+                    "scenario": shown_name,
+                    "path": str(scenario_dir),
+                    "images": count_images(scenario_dir / "images"),
+                    "precision": float(metrics.box.mp),
+                    "recall": float(metrics.box.mr),
+                    "map50": float(metrics.box.map50),
+                    "map5095": float(metrics.box.map),
+                    "inference_ms": inference_ms,
+                    "fps": 1000.0 / inference_ms if inference_ms > 0 else 0.0,
+                    "classes": class_rows,
+                    "curves": curves,
                 })
+                queue.put(("progress", int(index / len(scenarios) * 100)))
+            publish_standard_ultralytics_report(standard_staging_dir, standard_report_dir)
 
-            pd.DataFrame(rows).to_excel(
-                scenario_out / "per_class_metrics.xlsx",
-                index=False
-            )
-
-            # ---------- PROGRESS ----------
-            percent = int(idx / total_scenarios * 100)
-            queue.put(("progress", percent))
-
-        # ---------- SUMMARY ----------
-        pd.DataFrame(summary_rows).to_excel(
-            output_root / "summary.xlsx",
-            index=False
-        )
-
-        queue.put(("log", "Тестирование завершено"))
-
-    except Exception as e:
-        queue.put((
-            "log",
-            f"Ошибка при тестировании:\n{str(e)}\n{traceback.format_exc()}"
+        report_path = str(write_report(
+            report_dir=report_dir,
+            model_path=model_path,
+            imgsz=imgsz,
+            device_name=device_name,
+            scenario_results=scenario_results,
+            dataset_class_names=class_names,
+            model_class_names=model_class_names,
+            ultralytics_version=ultralytics.__version__,
         ))
-
+        queue.put(("report", report_path))
+        queue.put(("log", f"Отчет сформирован: {report_path}"))
+        success = True
+    except Exception as exc:
+        queue.put(("log", f"Ошибка при тестировании:\n{exc}\n{traceback.format_exc()}"))
     finally:
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        except:
+        except Exception:
             pass
-
-        queue.put(("finished", True))
+        queue.put(("finished", success, report_path))
 
 
 class YOLOTestWorker(QObject):
     progress = pyqtSignal(int)
     log = pyqtSignal(str)
     scenario_info = pyqtSignal(str, int, int)
-    finished = pyqtSignal(bool)
+    report_created = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.process = None
         self.queue = None
 
-    def start_evaluation(
-        self,
-        model_path,
-        test_root,
-        class_names,
-        imgsz=640,
-        gpu=True
-    ):
+    def start_evaluation(self, model_path, scenarios, report_dir, class_names, imgsz=640, gpu=True):
         self.queue = mp.Queue()
-
         self.process = mp.Process(
             target=yolo_test_process,
-            args=(
-                self.queue,
-                model_path,
-                test_root,
-                class_names,
-                imgsz,
-                gpu,
-                True,  # export_pr
-                51  # pr_steps
-            ),
-            daemon=False
+            args=(self.queue, model_path, scenarios, report_dir, class_names, imgsz, gpu),
+            daemon=False,
         )
-
         self.process.start()
 
     def poll_queue(self):
-        """
-        Вызывать таймером (QTimer) из UI
-        """
-        while not self.queue.empty():
-            msg = self.queue.get()
-
-            msg_type = msg[0]
-
-            if msg_type == "progress":
-                self.progress.emit(msg[1])
-
-            elif msg_type == "log":
-                self.log.emit(msg[1])
-
-            elif msg_type == "scenario_info":
-                _, name, idx, total = msg
-                self.scenario_info.emit(name, idx, total)
-
-            elif msg_type == "finished":
-                self.finished.emit(True)
+        """Считывает все готовые сообщения без ненадежного Queue.empty()."""
+        if self.queue is None:
+            return
+        while True:
+            try:
+                message = self.queue.get_nowait()
+            except queue_module.Empty:
+                break
+            message_type = message[0]
+            if message_type == "progress":
+                self.progress.emit(message[1])
+            elif message_type == "log":
+                self.log.emit(message[1])
+            elif message_type == "scenario_info":
+                _, name, index, total = message
+                self.scenario_info.emit(name, index, total)
+            elif message_type == "report":
+                self.report_created.emit(message[1])
+            elif message_type == "finished":
+                self.finished.emit(message[1], message[2])

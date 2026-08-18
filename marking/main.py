@@ -3,6 +3,8 @@ import os
 import queue
 import sys
 import textwrap
+from collections import Counter
+from pathlib import Path
 
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt, QEvent, QAbstractTableModel, QModelIndex, QThread, QTimer
@@ -28,6 +30,8 @@ import yaml
 import random
 import multiprocessing as mp
 from modelTest import YOLOTestWorker
+from evaluation_report import display_scenario, resolve_scenario_directory
+from tools.organize_test_scenarios import apply_plan, build_plan
 from dataset_utils import (
     IMAGE_EXTENSIONS,
     find_annotation_sets,
@@ -47,6 +51,15 @@ def resource_path(relative_path):
 
 def icon_path(filename):
     return resource_path(os.path.join("assets", "icons", filename))
+
+
+DEFAULT_TEST_SCENARIOS = (
+    ("Осадки", ("fallout", "precipitation", "rain", "осадки")),
+    ("Туман", ("fog", "туман")),
+    ("День", ("afternoon", "day", "день")),
+    ("Ночь", ("night", "ночь")),
+    ("Сумерки", ("twilight", "dusk", "сумерки")),
+)
 
 
 def apply_application_style(app):
@@ -639,6 +652,7 @@ class MainWindow(QMainWindow):
         self.ui.toolButton_add_class.setIcon(QIcon(icon_path("add.png")))
         self.ui.toolButton_delete_class.setIcon(QIcon(icon_path("delete.png")))
         self.ui.toolButton_reset_class_info.setIcon(QIcon(icon_path("reset.png")))
+        self.setup_testing_controls()
 
         self.ui.treeWidget_menu.setTextElideMode(Qt.ElideNone)
         self.ui.treeWidget_menu.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -667,6 +681,7 @@ class MainWindow(QMainWindow):
         self.yoloWorker = None
         self.active_process_kind = None
         self.annotation_clipboard = []
+        self.training_analysis = None
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_queue)
@@ -860,6 +875,7 @@ class MainWindow(QMainWindow):
 
     def configure_source_panel(self, section):
         """Show only inputs needed by the selected workflow."""
+        self.current_section = section
         model_widgets = (
             self.ui.label_model_path,
             self.ui.lineEdit_model_path,
@@ -881,11 +897,13 @@ class MainWindow(QMainWindow):
 
         if section == "marking":
             self.ui.groupBox_src_files.setTitle("Данные для разметки")
+            self.ui.label_dataset_path.setText("Папка датасета:")
             self.ui.label_source_hint.setText(
                 "Выберите папку датасета. data.yaml определится автоматически."
             )
         elif section == "training":
             self.ui.groupBox_src_files.setTitle("Данные для обучения")
+            self.ui.label_dataset_path.setText("Папка датасета:")
             self.ui.label_model_path.setText("Начальная модель детекции:")
             self.ui.lineEdit_model_path.setPlaceholderText("Например, yolov12n.pt")
             self.ui.label_source_hint.setText(
@@ -894,15 +912,262 @@ class MainWindow(QMainWindow):
         elif section == "testing":
             self.ui.groupBox_src_files.setTitle("Данные для тестирования")
             self.ui.label_model_path.setText("Обученная модель детекции:")
+            self.ui.label_dataset_path.setText("Корневая папка (необязательно):")
             self.ui.lineEdit_model_path.setPlaceholderText("Модель, качество которой нужно оценить")
             self.ui.label_source_hint.setText(
-                "Для тестирования выберите обученную модель, папку тестовых сценариев и data.yaml."
+                "Состав теста задается ниже: для каждого сценария выберите отдельную папку."
             )
+            QTimer.singleShot(0, self.suggest_test_scenario_paths)
         else:
             self.ui.groupBox_src_files.setTitle("Данные для редактирования классов")
+            self.ui.label_dataset_path.setText("Папка датасета:")
             self.ui.label_source_hint.setText(
                 "Выберите корень датасета и data.yaml. Модель для изменения классов не требуется."
             )
+
+    def setup_testing_controls(self):
+        """Создает редактор явного списка тестовых сценариев."""
+        settings_layout = self.ui.gridLayout_9
+        settings_layout.removeWidget(self.ui.checkBox_gpu_2)
+
+        self.groupBox_test_scenarios = QtWidgets.QGroupBox("Сценарии тестирования", self.ui.groupBox_test_settings)
+        scenarios_layout = QtWidgets.QVBoxLayout(self.groupBox_test_scenarios)
+        self.tableWidget_test_scenarios = QtWidgets.QTableWidget(0, 3, self.groupBox_test_scenarios)
+        self.tableWidget_test_scenarios.setHorizontalHeaderLabels(("Название", "Папка", ""))
+        self.tableWidget_test_scenarios.verticalHeader().setVisible(False)
+        self.tableWidget_test_scenarios.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tableWidget_test_scenarios.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tableWidget_test_scenarios.setMinimumHeight(210)
+        header = self.tableWidget_test_scenarios.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        header.resizeSection(2, 46)
+        scenarios_layout.addWidget(self.tableWidget_test_scenarios)
+
+        actions_layout = QtWidgets.QHBoxLayout()
+        self.toolButton_add_test_scenario = QtWidgets.QToolButton(self.groupBox_test_scenarios)
+        self.toolButton_add_test_scenario.setIcon(QIcon(icon_path("add.png")))
+        self.toolButton_add_test_scenario.setToolTip("Добавить сценарий")
+        self.toolButton_remove_test_scenario = QtWidgets.QToolButton(self.groupBox_test_scenarios)
+        self.toolButton_remove_test_scenario.setIcon(QIcon(icon_path("delete.png")))
+        self.toolButton_remove_test_scenario.setToolTip("Удалить выбранный сценарий")
+        self.toolButton_restore_test_scenarios = QtWidgets.QToolButton(self.groupBox_test_scenarios)
+        self.toolButton_restore_test_scenarios.setIcon(QIcon(icon_path("reset.png")))
+        self.toolButton_restore_test_scenarios.setToolTip(
+            "Восстановить папки сценариев по названиям файлов Roboflow"
+        )
+        actions_layout.addWidget(self.toolButton_add_test_scenario)
+        actions_layout.addWidget(self.toolButton_remove_test_scenario)
+        actions_layout.addSpacing(10)
+        actions_layout.addWidget(self.toolButton_restore_test_scenarios)
+        actions_layout.addStretch()
+        scenarios_layout.addLayout(actions_layout)
+        settings_layout.addWidget(self.groupBox_test_scenarios, 1, 0, 1, 2)
+
+        self.label_test_report_path = QtWidgets.QLabel("Папка отчета:", self.ui.groupBox_test_settings)
+        self.lineEdit_test_report_path = QtWidgets.QLineEdit(self.ui.groupBox_test_settings)
+        self.lineEdit_test_report_path.setPlaceholderText("Куда сохранить Excel и графики")
+        self.pushButton_test_report_path = QtWidgets.QPushButton(self.ui.groupBox_test_settings)
+        self.pushButton_test_report_path.setIcon(QIcon(icon_path("search.png")))
+        self.pushButton_test_report_path.setFixedWidth(46)
+        report_layout = QtWidgets.QHBoxLayout()
+        report_layout.setContentsMargins(0, 0, 0, 0)
+        report_layout.addWidget(self.lineEdit_test_report_path)
+        report_layout.addWidget(self.pushButton_test_report_path)
+        settings_layout.addWidget(self.label_test_report_path, 2, 0)
+        settings_layout.addLayout(report_layout, 2, 1)
+        settings_layout.addWidget(self.ui.checkBox_gpu_2, 3, 0, 1, 2)
+        settings_layout.setRowStretch(1, 1)
+
+        for name, _aliases in DEFAULT_TEST_SCENARIOS:
+            self.add_test_scenario_row(name)
+        self.toolButton_add_test_scenario.clicked.connect(self.add_test_scenario_row)
+        self.toolButton_remove_test_scenario.clicked.connect(self.remove_test_scenario_row)
+        self.toolButton_restore_test_scenarios.clicked.connect(self.restore_test_scenarios_from_names)
+        self.pushButton_test_report_path.clicked.connect(self.choose_test_report_path)
+
+    def add_test_scenario_row(self, name="", folder=""):
+        if isinstance(name, bool):  # сигнал clicked передает checked
+            name = ""
+        row = self.tableWidget_test_scenarios.rowCount()
+        self.tableWidget_test_scenarios.insertRow(row)
+        self.tableWidget_test_scenarios.setItem(row, 0, QtWidgets.QTableWidgetItem(name or "Новый сценарий"))
+        path_item = QtWidgets.QTableWidgetItem(str(folder))
+        path_item.setFlags(path_item.flags() & ~Qt.ItemIsEditable)
+        self.tableWidget_test_scenarios.setItem(row, 1, path_item)
+        button = QtWidgets.QToolButton(self.tableWidget_test_scenarios)
+        button.setIcon(QIcon(icon_path("search.png")))
+        button.setToolTip("Выбрать папку с подпапками images и labels")
+        button.clicked.connect(lambda _checked=False, current_button=button: self.choose_test_scenario_folder(current_button))
+        self.tableWidget_test_scenarios.setCellWidget(row, 2, button)
+
+    def remove_test_scenario_row(self):
+        row = self.tableWidget_test_scenarios.currentRow()
+        if row >= 0:
+            self.tableWidget_test_scenarios.removeRow(row)
+
+    def choose_test_scenario_folder(self, button):
+        row = next((index for index in range(self.tableWidget_test_scenarios.rowCount())
+                    if self.tableWidget_test_scenarios.cellWidget(index, 2) is button), -1)
+        if row < 0:
+            return
+        current = self.tableWidget_test_scenarios.item(row, 1).text().strip()
+        start = current or self.ui.lineEdit_dataset_path.text().strip() or os.getcwd()
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку сценария", start)
+        if folder:
+            try:
+                resolved = resolve_scenario_directory(folder)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Неверная папка сценария", str(exc))
+                return
+            self.tableWidget_test_scenarios.item(row, 1).setText(str(resolved))
+
+    def choose_test_report_path(self):
+        current = self.lineEdit_test_report_path.text().strip()
+        start = current or self.ui.lineEdit_dataset_path.text().strip() or os.getcwd()
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для отчета", start)
+        if folder:
+            self.lineEdit_test_report_path.setText(folder)
+
+    def suggest_test_scenario_paths(self, offer_restore=False):
+        """Заполняет только пустые строки, не меняя ручной выбор пользователя."""
+        root_text = self.ui.lineEdit_dataset_path.text().strip()
+        if not root_text or not Path(root_text).is_dir():
+            return
+        root = Path(root_text)
+        search_roots = (root, root / "test_scenarios")
+        aliases_by_name = dict(DEFAULT_TEST_SCENARIOS)
+        for row in range(self.tableWidget_test_scenarios.rowCount()):
+            path_item = self.tableWidget_test_scenarios.item(row, 1)
+            if path_item.text().strip():
+                continue
+            name = self.tableWidget_test_scenarios.item(row, 0).text().strip()
+            for base in search_roots:
+                match = next((base / alias for alias in aliases_by_name.get(name, ())
+                              if (base / alias / "images").is_dir() and (base / alias / "labels").is_dir()), None)
+                if match:
+                    path_item.setText(str(match.resolve()))
+                    break
+        if not self.lineEdit_test_report_path.text().strip():
+            self.lineEdit_test_report_path.setText(str((root / "Отчет_тестирования").resolve()))
+        has_missing_paths = any(
+            not self.tableWidget_test_scenarios.item(row, 1).text().strip()
+            for row in range(self.tableWidget_test_scenarios.rowCount())
+        )
+        if offer_restore and has_missing_paths:
+            self.restore_test_scenarios_from_names(
+                ask_before_apply=True, silent_if_unavailable=True
+            )
+
+    def restore_test_scenarios_from_names(self, _checked=False, ask_before_apply=True,
+                                          silent_if_unavailable=False):
+        """Создает неизменяющее исходники сценарное представление плоского test split."""
+        root_text = self.ui.lineEdit_dataset_path.text().strip()
+        if not root_text or not Path(root_text).is_dir():
+            QMessageBox.warning(
+                self, "Не выбран корень датасета",
+                "Сначала выберите корень Roboflow-датасета в верхней части окна."
+            )
+            return False
+        try:
+            output, plan, unknown, missing_labels = build_plan(root_text, None)
+        except ValueError as exc:
+            if not silent_if_unavailable:
+                QMessageBox.warning(self, "Невозможно восстановить сценарии", str(exc))
+            return False
+        if not plan:
+            if not silent_if_unavailable:
+                QMessageBox.information(
+                    self, "Сценарии не найдены",
+                    "В именах изображений не найдены префиксы afternoon, night, twilight, fog или fallout."
+                )
+            return False
+
+        counts = Counter(destination.parents[1].name for _, destination in plan[::2])
+        count_text = "\n".join(
+            f"• {display_scenario(name)}: {count} изображений"
+            for name, count in sorted(counts.items())
+        )
+        details = (
+            f"По именам файлов найдены сценарии:\n{count_text}\n\n"
+            f"Будет создано отдельное представление:\n{output}\n\n"
+            "Исходные train, valid и test не изменятся. Сначала используются жесткие ссылки; "
+            "если они недоступны, файлы будут скопированы."
+        )
+        if unknown:
+            details += f"\n\nНе распознано и будет пропущено изображений: {len(unknown)}."
+        if missing_labels:
+            details += f"\nНе найдено разметок и будет пропущено изображений: {len(missing_labels)}."
+
+        if ask_before_apply:
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Восстановить сценарии")
+            dialog.setText(details)
+            dialog.setIcon(QMessageBox.Question)
+            yes_button = dialog.addButton("Да", QMessageBox.YesRole)
+            dialog.addButton("Нет", QMessageBox.NoRole)
+            dialog.setDefaultButton(yes_button)
+            dialog.exec_()
+            if dialog.clickedButton() is not yes_button:
+                return False
+        progress = QtWidgets.QProgressDialog(
+            "Восстановление папок сценариев…", "", 0, len(plan), self
+        )
+        progress.setWindowTitle("Подготовка тестовой выборки")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def update_restore_progress(current, total):
+            if current == total or current % 25 == 0:
+                progress.setValue(current)
+                QtWidgets.QApplication.processEvents()
+
+        try:
+            status = apply_plan(
+                plan,
+                strategy="hardlink",
+                fallback_to_copy=True,
+                progress_callback=update_restore_progress,
+            )
+        except (OSError, FileExistsError) as exc:
+            QMessageBox.critical(self, "Не удалось восстановить сценарии", str(exc))
+            return False
+        finally:
+            progress.close()
+
+        # После создания повторно заполняем таблицу, но уже без нового вопроса.
+        self.suggest_test_scenario_paths(offer_restore=False)
+        created = status["created"] + status["copied"]
+        QMessageBox.information(
+            self, "Сценарии восстановлены",
+            f"Готово. Создано файлов: {created}; уже существовало: {status['skipped']}.\n\n{output}"
+        )
+        return True
+
+    def configured_test_scenarios(self):
+        scenarios, errors, used_names = [], [], set()
+        for row in range(self.tableWidget_test_scenarios.rowCount()):
+            name = self.tableWidget_test_scenarios.item(row, 0).text().strip()
+            folder = self.tableWidget_test_scenarios.item(row, 1).text().strip()
+            if not name:
+                errors.append(f"Строка {row + 1}: укажите название сценария.")
+                continue
+            if name.casefold() in used_names:
+                errors.append(f"Название сценария «{name}» повторяется.")
+                continue
+            used_names.add(name.casefold())
+            if not folder:
+                errors.append(f"Сценарий «{name}»: выберите папку.")
+                continue
+            try:
+                folder = str(resolve_scenario_directory(folder))
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            scenarios.append((name, folder))
+        return scenarios, errors
 
     def resizeEvent(self, event):
         super().resizeEvent(event)  # стандартная обработка resize
@@ -1153,6 +1418,8 @@ class MainWindow(QMainWindow):
             yaml_path = find_dataset_yaml(dataset_path)
             if yaml_path:
                 self.ui.lineEdit_yaml_path.setText(str(yaml_path))
+            if getattr(self, "current_section", None) == "testing":
+                self.suggest_test_scenario_paths(offer_restore=True)
 
     def choose_yaml_path(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1947,12 +2214,41 @@ class MainWindow(QMainWindow):
                 _, text = msg
                 self.autolabling_log(text)  # выводим лог в GUI
 
+            elif msg[0] == "training_analysis":
+                self.training_analysis = msg[1]
+
+            elif msg[0] == "analysis_error":
+                QMessageBox.warning(self, "Анализ обучения", msg[1])
+
             elif msg[0] == "progress":
                 _, percent = msg
                 self.ui.progressBar_autolabling.setValue(percent)
 
             elif msg[0] == "finished":
-                self.stop_training(completed=True)
+                process_kind = self.active_process_kind
+                success = msg[1] if len(msg) > 1 else True
+                self.stop_training(completed=success)
+                if process_kind == "training" and success and self.training_analysis:
+                    self.show_training_analysis(self.training_analysis)
+
+    def show_training_analysis(self, analysis):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Оценка завершенного обучения")
+        warning_verdicts = {"overfitting", "check_data", "review"}
+        dialog.setIcon(
+            QMessageBox.Warning if analysis.get("verdict") in warning_verdicts
+            else QMessageBox.Information
+        )
+        dialog.setText(f"<b>{html.escape(analysis['title'])}</b><br><br>{html.escape(analysis['summary'])}")
+        dialog.setInformativeText(
+            "<b>Рекомендация:</b><br>" + html.escape(analysis["recommendation"])
+        )
+        details = list(analysis.get("details", []))
+        if analysis.get("report_path"):
+            details.extend(("", f"Отчет: {analysis['report_path']}"))
+        dialog.setDetailedText("\n".join(details))
+        dialog.addButton("Закрыть", QMessageBox.AcceptRole)
+        dialog.exec_()
 
     def start_training(self):
         model_path = self.ui.lineEdit_model_path.text().strip()
@@ -1972,6 +2268,7 @@ class MainWindow(QMainWindow):
             return
 
         self.yoloWorker = ModelWorker(model_path)
+        self.training_analysis = None
 
         epochs = self.ui.spinBox_epochs.value()
         using_gpu = self.ui.checkBox_gpu.isChecked()
@@ -2000,41 +2297,72 @@ class MainWindow(QMainWindow):
 
         self.timer.start(100)  # 10 раз в секунду
 
-    def on_test_finished(self, result):
+    def on_test_finished(self, result, report_path=""):
         self.timer.stop()
 
-        if self.yoloWorker.process and self.yoloWorker.process.is_alive():
-            self.yoloWorker.process.terminate()
-            self.yoloWorker.process.join(timeout=5)
+        if self.yoloWorker.process:
+            # Сообщение finished отправляется в самом конце процесса. Сначала
+            # даем ему штатно завершиться и сбросить очередь, а не обрываем его.
+            self.yoloWorker.process.join(timeout=2)
+            if self.yoloWorker.process.is_alive():
+                self.yoloWorker.process.terminate()
+                self.yoloWorker.process.join(timeout=5)
 
         self.ui.progressBar_testing.setVisible(False)
+        self.ui.progressBar_testing.setFormat("%p%")
         if result:
             QMessageBox.information(
                 self,
-                "Информация",
-                "Тестирование успешно завершено!"
+                "Тестирование завершено",
+                "Тестирование успешно завершено.\n\n"
+                f"Отчет сохранен:\n{report_path}"
             )
         else:
             QMessageBox.critical(
                 self,
                 "Ошибка",
-                "Ошибка тестирования!"
+                "Не удалось завершить тестирование. Подробности записаны в консоль."
             )
 
     def on_testing_log(self, log):
         print(log)
 
+    def on_testing_scenario(self, name, index, total):
+        self.ui.progressBar_testing.setFormat(f"{name} ({index}/{total}) — %p%")
+
     def start_model_test(self):
         model_path = self.ui.lineEdit_model_path.text()
         if not os.path.exists(model_path):
-            return
-
-        dataset_path = self.ui.lineEdit_dataset_path.text()
-        if not os.path.exists(dataset_path):
+            QMessageBox.warning(self, "Не выбрана модель", "Укажите существующий файл модели.")
             return
 
         yaml_path = self.ui.lineEdit_yaml_path.text()
         if not os.path.exists(yaml_path):
+            QMessageBox.warning(self, "Не выбраны классы", "Укажите существующий data.yaml.")
+            return
+
+        scenarios, scenario_errors = self.configured_test_scenarios()
+        if scenario_errors:
+            QMessageBox.warning(
+                self,
+                "Проверьте сценарии",
+                "Не все сценарии настроены:\n\n" + "\n".join(f"• {error}" for error in scenario_errors),
+            )
+            return
+        if not scenarios:
+            QMessageBox.warning(self, "Нет сценариев", "Добавьте хотя бы один сценарий тестирования.")
+            return
+
+        report_dir = self.lineEdit_test_report_path.text().strip()
+        if not report_dir:
+            report_dir = QFileDialog.getExistingDirectory(self, "Выберите папку для отчета", os.getcwd())
+            if not report_dir:
+                return
+            self.lineEdit_test_report_path.setText(report_dir)
+        try:
+            Path(report_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Невозможно сохранить отчет", str(exc))
             return
 
         self.load_classes(yaml_path)
@@ -2043,7 +2371,7 @@ class MainWindow(QMainWindow):
 
         self.yoloWorker.progress.connect(self.ui.progressBar_testing.setValue)
         self.yoloWorker.log.connect(self.on_testing_log)
-        # self.yoloWorker.scenario_info.connect(self.on_scenario)
+        self.yoloWorker.scenario_info.connect(self.on_testing_scenario)
         self.yoloWorker.finished.connect(self.on_test_finished)
 
         self.ui.progressBar_testing.setValue(0)
@@ -2051,7 +2379,8 @@ class MainWindow(QMainWindow):
 
         self.yoloWorker.start_evaluation(
             model_path=model_path,
-            test_root=dataset_path,
+            scenarios=scenarios,
+            report_dir=report_dir,
             class_names=self.class_names,
             imgsz=int(self.ui.comboBox_2.currentText()),
             gpu=self.ui.checkBox_gpu_2.isChecked()

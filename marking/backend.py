@@ -10,6 +10,7 @@ import torch
 import traceback
 import multiprocessing as mp
 from training_progress import calculate_training_progress
+from training_analysis import analyze_training_results, save_training_analysis
 
 
 def model_autolabel_process(
@@ -105,6 +106,7 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
     import traceback
     from ultralytics import YOLO
 
+    success = False
     try:
         if torch.cuda.is_available() and gpu:
             device = 0
@@ -190,8 +192,18 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
             device=device,
             workers=workers
         )
-
-        queue.put(("log", "Обучение завершено!"))
+        success = True
+        try:
+            run_dir = Path(model.trainer.save_dir)
+            analysis = analyze_training_results(run_dir / "results.csv")
+            analysis["report_path"] = str(save_training_analysis(run_dir, analysis))
+            analysis["run_dir"] = str(run_dir)
+            queue.put(("training_analysis", analysis))
+        except Exception as analysis_error:
+            queue.put((
+                "analysis_error",
+                f"Обучение завершено, но анализировать динамику не удалось: {analysis_error}",
+            ))
 
     except Exception as e:
         queue.put((
@@ -209,7 +221,7 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
             pass
 
         try:
-            queue.put(("finished", True))
+            queue.put(("finished", success))
         except:
             pass
 

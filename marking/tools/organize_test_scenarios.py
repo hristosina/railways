@@ -49,6 +49,25 @@ def transfer(source, destination, strategy):
     return "created"
 
 
+def apply_plan(plan, strategy="hardlink", fallback_to_copy=True, progress_callback=None):
+    """Создает сценарное представление, при необходимости заменяя hardlink копией."""
+    status = Counter()
+    total = len(plan)
+    for index, (source, destination) in enumerate(plan, start=1):
+        try:
+            result = transfer(source, destination, strategy)
+        except OSError:
+            if strategy != "hardlink" or not fallback_to_copy:
+                raise
+            result = transfer(source, destination, "copy")
+            if result == "created":
+                result = "copied"
+        status[result] += 1
+        if progress_callback:
+            progress_callback(index, total)
+    return status
+
+
 def build_plan(source_path, output_path):
     images_dir = find_test_images(source_path)
     labels_dir = images_dir.parent / "labels"
@@ -99,8 +118,9 @@ def main(argv=None):
         print(f"Dry-run: готово к созданию {len(plan)} файлов. Добавьте --apply для выполнения.")
         return 0
 
-    status = Counter(transfer(source, destination, args.strategy) for source, destination in plan)
-    print(f"Готово: создано {status['created']}, уже существовало {status['skipped']}.")
+    status = apply_plan(plan, args.strategy)
+    created = status["created"] + status["copied"]
+    print(f"Готово: создано {created}, уже существовало {status['skipped']}.")
     return 0
 
 
