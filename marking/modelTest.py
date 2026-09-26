@@ -8,7 +8,7 @@ import torch
 import ultralytics
 import yaml
 from PyQt5.QtCore import QObject, pyqtSignal
-from ultralytics import YOLO
+from model_catalog import create_model_runtime, get_model_profile
 
 from evaluation_report import (
     aligned_scenario_view,
@@ -38,7 +38,9 @@ def create_temp_data_yaml(scenario_dir, class_names, output_dir):
     return yaml_path
 
 
-def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, imgsz, gpu):
+def model_test_process(
+    queue, model_profile_id, model_path, scenarios, report_dir, class_names, imgsz, gpu
+):
     success, report_path = False, ""
     try:
         if torch.cuda.is_available() and gpu:
@@ -55,7 +57,9 @@ def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, img
         report_dir = Path(report_dir).resolve()
         standard_report_dir = report_dir / "Стандартный_отчет_Ultralytics"
         queue.put(("log", f"Найдено сценариев: {len(scenarios)}"))
-        model = YOLO(model_path)
+        profile = get_model_profile(model_profile_id)
+        queue.put(("log", f"Архитектура: {profile.display_name}; backend: {profile.backend_id}"))
+        model = create_model_runtime(model_profile_id, model_path)
         model_class_names = normalize_class_names(model.names)
         mapping = class_id_mapping(class_names, model_class_names)
         if any(source_id != target_id for source_id, target_id in mapping.items()):
@@ -140,6 +144,7 @@ def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, img
             dataset_class_names=class_names,
             model_class_names=model_class_names,
             ultralytics_version=ultralytics.__version__,
+            model_profile_name=profile.display_name,
         ))
         queue.put(("report", report_path))
         queue.put(("log", f"Отчет сформирован: {report_path}"))
@@ -155,7 +160,7 @@ def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, img
         queue.put(("finished", success, report_path))
 
 
-class YOLOTestWorker(QObject):
+class ModelTestWorker(QObject):
     progress = pyqtSignal(int)
     log = pyqtSignal(str)
     scenario_info = pyqtSignal(str, int, int)
@@ -167,11 +172,17 @@ class YOLOTestWorker(QObject):
         self.process = None
         self.queue = None
 
-    def start_evaluation(self, model_path, scenarios, report_dir, class_names, imgsz=640, gpu=True):
+    def start_evaluation(
+        self, model_profile_id, model_path, scenarios, report_dir, class_names,
+        imgsz=640, gpu=True
+    ):
         self.queue = mp.Queue()
         self.process = mp.Process(
-            target=yolo_test_process,
-            args=(self.queue, model_path, scenarios, report_dir, class_names, imgsz, gpu),
+            target=model_test_process,
+            args=(
+                self.queue, model_profile_id, model_path, scenarios,
+                report_dir, class_names, imgsz, gpu
+            ),
             daemon=False,
         )
         self.process.start()
@@ -197,3 +208,14 @@ class YOLOTestWorker(QObject):
                 self.report_created.emit(message[1])
             elif message_type == "finished":
                 self.finished.emit(message[1], message[2])
+
+
+def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, imgsz, gpu):
+    """Совместимость со старой публичной функцией."""
+    return model_test_process(
+        queue, "yolov12s", model_path, scenarios, report_dir, class_names, imgsz, gpu
+    )
+
+
+# Старое имя оставлено для совместимости с существующим кодом.
+YOLOTestWorker = ModelTestWorker

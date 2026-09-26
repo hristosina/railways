@@ -97,7 +97,50 @@ def find_annotation_sets(dataset_path):
 
     result = []
     for candidate in (root, *sorted((p for p in root.rglob("*") if p.is_dir()), key=str)):
+        if ".marking_trash" in candidate.parts:
+            continue
         images_dir = candidate / "images"
         if images_dir.is_dir() and contains_images(images_dir):
             result.append(candidate)
     return result
+
+
+def move_annotation_pair_to_trash(image_path, label_path, trash_root=None):
+    """Убирает изображение и его YOLO-разметку из split в локальную корзину."""
+    image_path = Path(image_path).expanduser().resolve()
+    label_path = Path(label_path).expanduser().resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Изображение не найдено: {image_path}")
+
+    annotation_root = image_path.parent.parent
+    trash_root = (
+        Path(trash_root).expanduser().resolve()
+        if trash_root is not None else annotation_root / ".marking_trash"
+    )
+    trash_images = trash_root / "images"
+    trash_labels = trash_root / "labels"
+    trash_images.mkdir(parents=True, exist_ok=True)
+    trash_labels.mkdir(parents=True, exist_ok=True)
+
+    suffix_index = 0
+    while True:
+        suffix = "" if suffix_index == 0 else f"_{suffix_index}"
+        destination_image = trash_images / f"{image_path.stem}{suffix}{image_path.suffix}"
+        destination_label = trash_labels / f"{image_path.stem}{suffix}.txt"
+        if not destination_image.exists() and not destination_label.exists():
+            break
+        suffix_index += 1
+
+    image_path.replace(destination_image)
+    try:
+        moved_label = None
+        if label_path.is_file():
+            label_path.replace(destination_label)
+            moved_label = destination_label
+    except Exception:
+        # Не оставляем split в наполовину измененном состоянии.
+        if destination_image.exists() and not image_path.exists():
+            destination_image.replace(image_path)
+        raise
+
+    return destination_image, moved_label, trash_root

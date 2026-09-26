@@ -13,10 +13,44 @@ from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-SCENARIO_RE = re.compile(
-    r"^(?:test_)?(?P<scenario>afternoon|night|twilight|fog|fallout)_",
-    re.IGNORECASE,
+SCENARIO_RE = re.compile(r"^(?:test_)?(?P<scenario>[^_]+)_", re.IGNORECASE)
+DEFAULT_SCENARIO_RULES = (
+    {"name": "Осадки", "folder": "fallout", "keywords": ("fallout", "precipitation", "rain", "осадки")},
+    {"name": "Туман", "folder": "fog", "keywords": ("fog", "туман")},
+    {"name": "День", "folder": "afternoon", "keywords": ("afternoon", "day", "день")},
+    {"name": "Ночь", "folder": "night", "keywords": ("night", "ночь")},
+    {"name": "Сумерки", "folder": "twilight", "keywords": ("twilight", "dusk", "сумерки")},
 )
+
+
+def safe_folder_name(value):
+    value = re.sub(r'[<>:"/\\|?*]+', "_", str(value).strip())
+    value = re.sub(r"\s+", "_", value).strip(" ._")
+    return value or "scenario"
+
+
+def normalize_scenario_rules(rules=None):
+    normalized = []
+    for index, rule in enumerate(rules or DEFAULT_SCENARIO_RULES, start=1):
+        if isinstance(rule, dict):
+            name = str(rule.get("name", "")).strip()
+            folder = safe_folder_name(rule.get("folder") or name)
+            keywords = rule.get("keywords", ())
+        else:
+            name, keywords = rule[:2]
+            folder = safe_folder_name(rule[2] if len(rule) > 2 else name)
+        if isinstance(keywords, str):
+            keywords = re.split(r"[,;\n]+", keywords)
+        keywords = tuple(dict.fromkeys(
+            str(keyword).strip().casefold() for keyword in keywords
+            if str(keyword).strip()
+        ))
+        if not name:
+            raise ValueError(f"Сценарий {index}: не указано название.")
+        if not keywords:
+            raise ValueError(f"Сценарий «{name}»: укажите хотя бы одно ключевое слово.")
+        normalized.append({"name": name, "folder": folder, "keywords": keywords})
+    return normalized
 
 
 def find_test_images(path):
@@ -31,9 +65,57 @@ def find_test_images(path):
     raise ValueError("Не найдена плоская папка test/images с изображениями.")
 
 
-def scenario_from_name(filename):
-    match = SCENARIO_RE.match(filename)
-    return match.group("scenario").lower() if match else None
+def _keyword_in_filename(filename, keyword):
+    stem = Path(filename).stem.casefold()
+    keyword_pattern = re.escape(keyword.casefold()).replace(r"\_", r"[_\-\s]+")
+    return bool(re.search(rf"(?:^|[_\-\s]){keyword_pattern}(?:[_\-\s]|$)", stem))
+
+
+def scenario_from_name(filename, scenario_rules=None):
+    for rule in normalize_scenario_rules(scenario_rules):
+        if any(_keyword_in_filename(filename, keyword) for keyword in rule["keywords"]):
+            return rule["folder"]
+    return None
+
+
+def infer_scenario_rules(source_path):
+    """Предлагает правила из реальных префиксов, не ограничивая их фиксированным списком."""
+    images_dir = find_test_images(source_path)
+    prefixes = Counter()
+    for image_path in sorted(images_dir.iterdir()):
+        if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        match = SCENARIO_RE.match(image_path.name)
+        if match:
+            prefixes[match.group("scenario").casefold()] += 1
+
+    proposals = []
+    used_defaults = set()
+    for prefix in sorted(prefixes):
+        default_index = next((
+            index for index, rule in enumerate(DEFAULT_SCENARIO_RULES)
+            if prefix in rule["keywords"]
+        ), None)
+        if default_index is not None:
+            if default_index in used_defaults:
+                continue
+            default = DEFAULT_SCENARIO_RULES[default_index]
+            present_keywords = tuple(
+                keyword for keyword in default["keywords"] if keyword in prefixes
+            ) or (prefix,)
+            proposals.append({
+                "name": default["name"],
+                "folder": default["folder"],
+                "keywords": present_keywords,
+            })
+            used_defaults.add(default_index)
+        else:
+            proposals.append({
+                "name": prefix.replace("-", " ").replace("_", " ").capitalize(),
+                "folder": safe_folder_name(prefix),
+                "keywords": (prefix,),
+            })
+    return proposals
 
 
 def transfer(source, destination, strategy):
@@ -68,7 +150,7 @@ def apply_plan(plan, strategy="hardlink", fallback_to_copy=True, progress_callba
     return status
 
 
-def build_plan(source_path, output_path):
+def build_plan(source_path, output_path, scenario_rules=None):
     images_dir = find_test_images(source_path)
     labels_dir = images_dir.parent / "labels"
     if not labels_dir.is_dir():
@@ -78,10 +160,11 @@ def build_plan(source_path, output_path):
     plan = []
     unknown = []
     missing_labels = []
+    rules = normalize_scenario_rules(scenario_rules)
     for image_path in sorted(images_dir.iterdir()):
         if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        scenario = scenario_from_name(image_path.name)
+        scenario = scenario_from_name(image_path.name, rules)
         if not scenario:
             unknown.append(image_path)
             continue

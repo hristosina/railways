@@ -3,7 +3,6 @@ import os
 import queue
 import sys
 import textwrap
-from collections import Counter
 from pathlib import Path
 
 from PyQt5 import QtWidgets, QtCore
@@ -29,16 +28,28 @@ from PyQt5.QtCore import QRectF
 import yaml
 import random
 import multiprocessing as mp
-from modelTest import YOLOTestWorker
-from evaluation_report import display_scenario, resolve_scenario_directory
-from tools.organize_test_scenarios import apply_plan, build_plan
+from modelTest import ModelTestWorker
+from model_catalog import (
+    available_model_profiles,
+    get_model_profile,
+    model_profile_status,
+)
+from evaluation_report import resolve_scenario_directory
 from dataset_utils import (
     IMAGE_EXTENSIONS,
     find_annotation_sets,
     find_dataset_yaml,
+    move_annotation_pair_to_trash,
     normalize_dataset_path,
     resolve_annotation_set,
 )
+from dataset_statistics import (
+    SPLIT_LABELS,
+    discover_dataset_scenarios,
+    generate_dataset_statistics_report,
+)
+from dataset_statistics_dialog import DatasetStatisticsDialog
+from scenario_setup_dialog import prepare_scenario_folders
 
 def resource_path(relative_path):
     """ Получить путь к ресурсам, как при
@@ -51,15 +62,6 @@ def resource_path(relative_path):
 
 def icon_path(filename):
     return resource_path(os.path.join("assets", "icons", filename))
-
-
-DEFAULT_TEST_SCENARIOS = (
-    ("Осадки", ("fallout", "precipitation", "rain", "осадки")),
-    ("Туман", ("fog", "туман")),
-    ("День", ("afternoon", "day", "день")),
-    ("Ночь", ("night", "ночь")),
-    ("Сумерки", ("twilight", "dusk", "сумерки")),
-)
 
 
 def apply_application_style(app):
@@ -620,6 +622,30 @@ class MergeDelegate(QStyledItemDelegate):
         if hasattr(model, 'update_ids'):
             model.update_ids()
 
+class DatasetStatisticsWorker(QThread):
+    completed = QtCore.pyqtSignal(object, str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, dataset_path, yaml_path, output_path, scenarios=None, parent=None):
+        super().__init__(parent)
+        self.dataset_path = dataset_path
+        self.yaml_path = yaml_path
+        self.output_path = output_path
+        self.scenarios = scenarios
+
+    def run(self):
+        try:
+            stats, report_path = generate_dataset_statistics_report(
+                self.dataset_path,
+                output_path=self.output_path,
+                yaml_path=self.yaml_path,
+                scenarios=self.scenarios,
+            )
+            self.completed.emit(stats, str(report_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -628,6 +654,7 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowIcon(QIcon(icon_path("railway.png")))
+        self.setup_undo_redo_layout()
         self.ui.menubar.setVisible(False)
         self.ui.centralwidget.layout().setContentsMargins(14, 12, 14, 10)
         self.ui.centralwidget.layout().setHorizontalSpacing(14)
@@ -652,7 +679,10 @@ class MainWindow(QMainWindow):
         self.ui.toolButton_add_class.setIcon(QIcon(icon_path("add.png")))
         self.ui.toolButton_delete_class.setIcon(QIcon(icon_path("delete.png")))
         self.ui.toolButton_reset_class_info.setIcon(QIcon(icon_path("reset.png")))
+        self.setup_image_navigation_controls()
+        self.setup_model_profile_controls()
         self.setup_testing_controls()
+        self.setup_dataset_statistics_controls()
 
         self.ui.treeWidget_menu.setTextElideMode(Qt.ElideNone)
         self.ui.treeWidget_menu.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -682,6 +712,7 @@ class MainWindow(QMainWindow):
         self.active_process_kind = None
         self.annotation_clipboard = []
         self.training_analysis = None
+        self.dataset_statistics_worker = None
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_queue)
@@ -734,12 +765,10 @@ class MainWindow(QMainWindow):
         self.shortcut_left.setContext(Qt.ApplicationShortcut)
         self.shortcut_left.activated.connect(self.ui.toolButton_prev.click)
 
-        self.shortcut_left.activated.connect(self.ui.toolButton_prev.click)
-
         self.ui.toolButton_delete.clicked.connect(self.delete_selected_boxes)
         # горячая клавиша Delete
         self.shortcut_delete = QShortcut(QKeySequence("Delete"), self)
-        self.shortcut_delete.activated.connect(self.ui.toolButton_delete.click)  # вызывает нажатие кнопки
+        self.shortcut_delete.activated.connect(self.delete_selection_or_image)
 
         self.shortcut_copy_annotations = QShortcut(QKeySequence.Copy, self)
         self.shortcut_copy_annotations.activated.connect(self.copy_active_context)
@@ -749,7 +778,6 @@ class MainWindow(QMainWindow):
         self.shortcut_clear_annotations.activated.connect(self.clear_current_annotations)
         self.shortcut_copy_previous = QShortcut(QKeySequence("Ctrl+P"), self)
         self.shortcut_copy_previous.activated.connect(self.copy_previous_annotations)
-
         self.ui.toolButton_edit.clicked.connect(self.edit_selected_boxes)
         # горячая клавиша Ctrl+E
         self.shortcut_ctrl_e = QShortcut(QKeySequence("Ctrl+E"), self)
@@ -800,6 +828,256 @@ class MainWindow(QMainWindow):
         self.set_annotation_controls_enabled(False)
         self.wrap_all_tooltips()
 
+    def setup_undo_redo_layout(self):
+        """Держит отмену и повтор в компактной группе у левого края панели."""
+        self.ui.gridLayout_7.removeWidget(self.ui.toolButton_cancel)
+        self.ui.gridLayout_7.removeWidget(self.ui.toolButton_apply)
+
+        self.undo_redo_container = QtWidgets.QWidget(self.ui.page_3)
+        self.undo_redo_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Maximum,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        layout = QtWidgets.QHBoxLayout(self.undo_redo_container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.ui.toolButton_cancel.setParent(self.undo_redo_container)
+        self.ui.toolButton_apply.setParent(self.undo_redo_container)
+        layout.addWidget(self.ui.toolButton_cancel)
+        layout.addWidget(self.ui.toolButton_apply)
+        self.ui.gridLayout_7.addWidget(
+            self.undo_redo_container, 3, 2, 1, 2, Qt.AlignLeft
+        )
+
+    def setup_dataset_statistics_controls(self):
+        """Добавляет общий для всех разделов экспорт статистики датасета."""
+        self.pushButton_dataset_statistics = QtWidgets.QPushButton(
+            "Сформировать статистику датасета (Excel)", self.ui.groupBox_src_files
+        )
+        self.pushButton_dataset_statistics.setToolTip(
+            "Посчитать изображения и объекты по train, val, test и тестовым сценариям. "
+            "Перед формированием можно настроить сценарии, путь и имя Excel-файла."
+        )
+        self.ui.gridLayout_3.addWidget(self.pushButton_dataset_statistics, 4, 0, 1, 3)
+        self.pushButton_dataset_statistics.clicked.connect(
+            self.generate_dataset_statistics
+        )
+
+    def generate_dataset_statistics(self):
+        dataset_path = self.ui.lineEdit_dataset_path.text().strip()
+        if not dataset_path:
+            QMessageBox.warning(
+                self, "Не выбран датасет",
+                "Сначала выберите корневую папку датасета."
+            )
+            return
+        try:
+            dataset_path = str(normalize_dataset_path(dataset_path))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Неверный датасет", str(exc))
+            return
+        yaml_path = self.ui.lineEdit_yaml_path.text().strip()
+        if not os.path.isfile(yaml_path):
+            detected_yaml = find_dataset_yaml(dataset_path)
+            if not detected_yaml:
+                QMessageBox.warning(
+                    self, "Не найден data.yaml",
+                    "Для статистики нужен data.yaml со списком классов."
+                )
+                return
+            yaml_path = str(detected_yaml)
+            self.ui.lineEdit_yaml_path.setText(yaml_path)
+
+        settings_dialog = DatasetStatisticsDialog(
+            dataset_path, yaml_path, icon_path, self
+        )
+        if settings_dialog.exec_() != QDialog.Accepted:
+            return
+        scenarios, output_path = settings_dialog.report_settings()
+        self.pushButton_dataset_statistics.setEnabled(False)
+        self.pushButton_dataset_statistics.setText("Формируется статистика…")
+        self.statusBar().showMessage("Чтение разметки и формирование Excel…")
+        self.dataset_statistics_worker = DatasetStatisticsWorker(
+            dataset_path, yaml_path, output_path, scenarios, self
+        )
+        self.dataset_statistics_worker.completed.connect(
+            self.on_dataset_statistics_ready
+        )
+        self.dataset_statistics_worker.failed.connect(
+            self.on_dataset_statistics_failed
+        )
+        self.dataset_statistics_worker.start()
+
+    def _finish_dataset_statistics(self):
+        self.pushButton_dataset_statistics.setEnabled(True)
+        self.pushButton_dataset_statistics.setText(
+            "Сформировать статистику датасета (Excel)"
+        )
+        self.dataset_statistics_worker = None
+
+    def on_dataset_statistics_ready(self, stats, report_path):
+        self._finish_dataset_statistics()
+        split_lines = [
+            f"{SPLIT_LABELS[split]}: {stats['splits'][split]['image_count']} изображений"
+            for split in ("train", "val", "test")
+        ]
+        scenario_text = (
+            f"\nСценариев test: {len(stats['scenarios'])}"
+            if stats["scenarios"] else "\nСценарии test не обнаружены"
+        )
+        problem_text = f"\nЗамечаний по разметке: {len(stats['problems'])}"
+        self.statusBar().showMessage(f"Отчет сохранен: {report_path}", 8000)
+        QMessageBox.information(
+            self, "Статистика датасета сформирована",
+            "\n".join(split_lines) + scenario_text + problem_text
+            + f"\n\nExcel сохранен:\n{report_path}"
+        )
+
+    def on_dataset_statistics_failed(self, message):
+        self._finish_dataset_statistics()
+        self.statusBar().clearMessage()
+        QMessageBox.critical(
+            self, "Не удалось сформировать статистику", message
+        )
+
+    def setup_image_navigation_controls(self):
+        """Добавляет переход к изображению по введенному порядковому номеру."""
+        self.label_image_number_prefix = QtWidgets.QLabel("Изображение", self.ui.page_3)
+        self.spinBox_image_number = QtWidgets.QSpinBox(self.ui.page_3)
+        self.spinBox_image_number.setRange(0, 0)
+        self.spinBox_image_number.setValue(0)
+        self.spinBox_image_number.setKeyboardTracking(False)
+        self.spinBox_image_number.setAlignment(Qt.AlignCenter)
+        self.spinBox_image_number.setFixedWidth(82)
+        self.spinBox_image_number.setToolTip(
+            "Введите порядковый номер изображения и нажмите Enter"
+        )
+        self.spinBox_image_number.setEnabled(False)
+
+        self.ui.gridLayout_7.addWidget(self.label_image_number_prefix, 8, 2)
+        self.ui.gridLayout_7.addWidget(self.spinBox_image_number, 8, 3)
+        self.ui.gridLayout_7.addWidget(self.ui.label_img_num, 8, 4, 1, 6)
+        self.ui.label_img_num.setText("из 0")
+        self.spinBox_image_number.valueChanged.connect(self.go_to_image_number)
+
+    def update_image_number_controls(self, image_path=None):
+        has_images = bool(self.image_items)
+        blocker = QtCore.QSignalBlocker(self.spinBox_image_number)
+        if has_images:
+            self.spinBox_image_number.setRange(1, len(self.image_items))
+            self.spinBox_image_number.setValue(self.current_index + 1)
+            filename = Path(image_path or self.image_items[self.current_index][0]).name
+            self.ui.label_img_num.setText(f"из {len(self.image_items)} ({filename})")
+        else:
+            self.spinBox_image_number.setRange(0, 0)
+            self.spinBox_image_number.setValue(0)
+            self.ui.label_img_num.setText("из 0")
+        del blocker
+        self.spinBox_image_number.setEnabled(has_images)
+
+    def go_to_image_number(self, number):
+        if not self.image_items or number < 1:
+            return
+        target_index = number - 1
+        if target_index == self.current_index:
+            return
+        if not 0 <= target_index < len(self.image_items):
+            return
+        self.save_current_labels()
+        self.current_index = target_index
+        image_path, label_path = self.image_items[self.current_index]
+        self.place_img(image_path, label_path)
+
+    def setup_model_profile_controls(self):
+        """Добавляет одинаковый выбор исследуемой архитектуры на обе вкладки."""
+        profiles = available_model_profiles()
+
+        self.label_training_model_profile = QtWidgets.QLabel(
+            "Архитектура модели:", self.ui.groupBox_training_settings
+        )
+        self.comboBox_training_model_profile = QtWidgets.QComboBox(
+            self.ui.groupBox_training_settings
+        )
+        self.label_training_model_status = QtWidgets.QLabel(
+            self.ui.groupBox_training_settings
+        )
+        self.label_training_model_status.setWordWrap(True)
+
+        training_rows = (
+            (self.ui.label_epochs, self.ui.spinBox_epochs),
+            (self.ui.label_imgsz, self.ui.comboBox),
+            (self.ui.label_batch, self.ui.spinBox_batch),
+        )
+        for row, (label, control) in enumerate(training_rows, start=1):
+            self.ui.gridLayout_4.addWidget(label, row, 0)
+            self.ui.gridLayout_4.addWidget(control, row, 1)
+        self.ui.gridLayout_4.addWidget(self.ui.checkBox_gpu, 4, 0, 1, 2)
+        self.ui.gridLayout_4.addWidget(self.label_training_model_profile, 0, 0)
+        self.ui.gridLayout_4.addWidget(self.comboBox_training_model_profile, 0, 1)
+        self.ui.gridLayout_4.addWidget(self.label_training_model_status, 5, 0, 1, 2)
+
+        self.label_testing_model_profile = QtWidgets.QLabel(
+            "Архитектура модели:", self.ui.groupBox_test_settings
+        )
+        self.comboBox_testing_model_profile = QtWidgets.QComboBox(
+            self.ui.groupBox_test_settings
+        )
+        self.label_testing_model_status = QtWidgets.QLabel(self.ui.groupBox_test_settings)
+        self.label_testing_model_status.setWordWrap(True)
+
+        for combo in (
+            self.comboBox_training_model_profile,
+            self.comboBox_testing_model_profile,
+        ):
+            for profile in profiles:
+                suffix = "" if profile.available else " — требуется backend"
+                combo.addItem(
+                    f"{profile.display_name} · {profile.paradigm}{suffix}", profile.id
+                )
+            default_index = combo.findData("yolov12s")
+            combo.setCurrentIndex(max(0, default_index))
+
+        self.comboBox_training_model_profile.currentIndexChanged.connect(
+            lambda: self.update_model_profile_ui("training")
+        )
+        self.comboBox_testing_model_profile.currentIndexChanged.connect(
+            lambda: self.update_model_profile_ui("testing")
+        )
+        self.update_model_profile_ui("training")
+        self.update_model_profile_ui("testing")
+
+    def selected_model_profile_id(self, section):
+        combo = (
+            self.comboBox_training_model_profile
+            if section == "training" else self.comboBox_testing_model_profile
+        )
+        return str(combo.currentData())
+
+    def update_model_profile_ui(self, section):
+        profile = get_model_profile(self.selected_model_profile_id(section))
+        available, status = model_profile_status(profile.id)
+        label = (
+            self.label_training_model_status
+            if section == "training" else self.label_testing_model_status
+        )
+        color = "#176b3a" if available else "#9a5b00"
+        label.setText(
+            f"Готово к запуску · {profile.backend_id}"
+            if available else "Backend пока не подключен — подробности в подсказке"
+        )
+        label.setStyleSheet(f"color: {color};")
+        label.setToolTip(status)
+        if getattr(self, "current_section", None) == section:
+            self.ui.lineEdit_model_path.setPlaceholderText(profile.default_artifact)
+
+    def require_selected_model_backend(self, section):
+        profile_id = self.selected_model_profile_id(section)
+        available, status = model_profile_status(profile_id)
+        if not available:
+            QMessageBox.warning(self, "Backend модели не подключен", status)
+            return None
+        return profile_id
+
 
     def get_existing_classes(self):
         return [row.original_name for row in self.classes_model.rows]
@@ -842,6 +1120,15 @@ class MainWindow(QMainWindow):
         )
         self.action_clear_annotations.triggered.connect(self.clear_current_annotations)
         menu.addSeparator()
+        self.action_delete_image = menu.addAction(
+            QIcon(icon_path("delete.png")),
+            "Удалить изображение из датасета (Delete)",
+        )
+        self.action_delete_image.setToolTip(
+            "Переместить текущее изображение и его разметку в .marking_trash"
+        )
+        self.action_delete_image.triggered.connect(self.delete_current_image)
+        menu.addSeparator()
         self.action_reset_annotations = menu.addAction(
             QIcon(icon_path("reset.png")), "Вернуть разметку к сохранённой версии"
         )
@@ -867,10 +1154,13 @@ class MainWindow(QMainWindow):
         has_next = enabled and self.current_index + 1 < len(self.image_items)
         self.ui.toolButton_prev.setEnabled(has_previous)
         self.ui.toolButton_next.setEnabled(has_next)
+        if hasattr(self, "spinBox_image_number"):
+            self.spinBox_image_number.setEnabled(enabled and bool(self.image_items))
         if hasattr(self, "action_copy_previous"):
             self.action_copy_previous.setEnabled(has_previous)
             self.action_apply_selected_folder.setEnabled(enabled)
             self.action_clear_annotations.setEnabled(enabled)
+            self.action_delete_image.setEnabled(enabled)
             self.action_reset_annotations.setEnabled(enabled)
 
     def configure_source_panel(self, section):
@@ -894,6 +1184,15 @@ class MainWindow(QMainWindow):
         for widget in yaml_widgets:
             widget.setVisible(show_yaml)
             widget.setEnabled(show_yaml)
+        show_statistics = section == "dataset_edit"
+        statistics_running = bool(
+            self.dataset_statistics_worker
+            and self.dataset_statistics_worker.isRunning()
+        )
+        self.pushButton_dataset_statistics.setVisible(show_statistics)
+        self.pushButton_dataset_statistics.setEnabled(
+            show_statistics and not statistics_running
+        )
 
         if section == "marking":
             self.ui.groupBox_src_files.setTitle("Данные для разметки")
@@ -905,7 +1204,7 @@ class MainWindow(QMainWindow):
             self.ui.groupBox_src_files.setTitle("Данные для обучения")
             self.ui.label_dataset_path.setText("Папка датасета:")
             self.ui.label_model_path.setText("Начальная модель детекции:")
-            self.ui.lineEdit_model_path.setPlaceholderText("Например, yolov12n.pt")
+            self.update_model_profile_ui("training")
             self.ui.label_source_hint.setText(
                 "Для обучения укажите начальную модель, корень датасета и data.yaml."
             )
@@ -913,7 +1212,7 @@ class MainWindow(QMainWindow):
             self.ui.groupBox_src_files.setTitle("Данные для тестирования")
             self.ui.label_model_path.setText("Обученная модель детекции:")
             self.ui.label_dataset_path.setText("Корневая папка (необязательно):")
-            self.ui.lineEdit_model_path.setPlaceholderText("Модель, качество которой нужно оценить")
+            self.update_model_profile_ui("testing")
             self.ui.label_source_hint.setText(
                 "Состав теста задается ниже: для каждого сценария выберите отдельную папку."
             )
@@ -929,6 +1228,11 @@ class MainWindow(QMainWindow):
         """Создает редактор явного списка тестовых сценариев."""
         settings_layout = self.ui.gridLayout_9
         settings_layout.removeWidget(self.ui.checkBox_gpu_2)
+        settings_layout.addWidget(self.label_testing_model_profile, 0, 0)
+        settings_layout.addWidget(self.comboBox_testing_model_profile, 0, 1)
+        settings_layout.addWidget(self.label_testing_model_status, 1, 0, 1, 2)
+        settings_layout.addWidget(self.ui.label_imgsz_2, 2, 0)
+        settings_layout.addWidget(self.ui.comboBox_2, 2, 1)
 
         self.groupBox_test_scenarios = QtWidgets.QGroupBox("Сценарии тестирования", self.ui.groupBox_test_settings)
         scenarios_layout = QtWidgets.QVBoxLayout(self.groupBox_test_scenarios)
@@ -955,7 +1259,7 @@ class MainWindow(QMainWindow):
         self.toolButton_restore_test_scenarios = QtWidgets.QToolButton(self.groupBox_test_scenarios)
         self.toolButton_restore_test_scenarios.setIcon(QIcon(icon_path("reset.png")))
         self.toolButton_restore_test_scenarios.setToolTip(
-            "Восстановить папки сценариев по названиям файлов Roboflow"
+            "Настроить сценарии и ключевые слова, затем создать сортированные папки"
         )
         actions_layout.addWidget(self.toolButton_add_test_scenario)
         actions_layout.addWidget(self.toolButton_remove_test_scenario)
@@ -963,7 +1267,7 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self.toolButton_restore_test_scenarios)
         actions_layout.addStretch()
         scenarios_layout.addLayout(actions_layout)
-        settings_layout.addWidget(self.groupBox_test_scenarios, 1, 0, 1, 2)
+        settings_layout.addWidget(self.groupBox_test_scenarios, 3, 0, 1, 2)
 
         self.label_test_report_path = QtWidgets.QLabel("Папка отчета:", self.ui.groupBox_test_settings)
         self.lineEdit_test_report_path = QtWidgets.QLineEdit(self.ui.groupBox_test_settings)
@@ -975,13 +1279,11 @@ class MainWindow(QMainWindow):
         report_layout.setContentsMargins(0, 0, 0, 0)
         report_layout.addWidget(self.lineEdit_test_report_path)
         report_layout.addWidget(self.pushButton_test_report_path)
-        settings_layout.addWidget(self.label_test_report_path, 2, 0)
-        settings_layout.addLayout(report_layout, 2, 1)
-        settings_layout.addWidget(self.ui.checkBox_gpu_2, 3, 0, 1, 2)
-        settings_layout.setRowStretch(1, 1)
+        settings_layout.addWidget(self.label_test_report_path, 4, 0)
+        settings_layout.addLayout(report_layout, 4, 1)
+        settings_layout.addWidget(self.ui.checkBox_gpu_2, 5, 0, 1, 2)
+        settings_layout.setRowStretch(3, 1)
 
-        for name, _aliases in DEFAULT_TEST_SCENARIOS:
-            self.add_test_scenario_row(name)
         self.toolButton_add_test_scenario.clicked.connect(self.add_test_scenario_row)
         self.toolButton_remove_test_scenario.clicked.connect(self.remove_test_scenario_row)
         self.toolButton_restore_test_scenarios.clicked.connect(self.restore_test_scenarios_from_names)
@@ -1035,34 +1337,66 @@ class MainWindow(QMainWindow):
         root_text = self.ui.lineEdit_dataset_path.text().strip()
         if not root_text or not Path(root_text).is_dir():
             return
-        root = Path(root_text)
-        search_roots = (root, root / "test_scenarios")
-        aliases_by_name = dict(DEFAULT_TEST_SCENARIOS)
-        for row in range(self.tableWidget_test_scenarios.rowCount()):
-            path_item = self.tableWidget_test_scenarios.item(row, 1)
-            if path_item.text().strip():
-                continue
-            name = self.tableWidget_test_scenarios.item(row, 0).text().strip()
-            for base in search_roots:
-                match = next((base / alias for alias in aliases_by_name.get(name, ())
-                              if (base / alias / "images").is_dir() and (base / alias / "labels").is_dir()), None)
-                if match:
-                    path_item.setText(str(match.resolve()))
-                    break
+        root = Path(root_text).resolve()
+        yaml_path = self.ui.lineEdit_yaml_path.text().strip() or None
+        try:
+            definitions = discover_dataset_scenarios(root, yaml_path=yaml_path)
+        except ValueError:
+            definitions = []
+        physical = [definition for definition in definitions if not definition.get("prefix")]
+        existing_rows = {
+            self.tableWidget_test_scenarios.item(row, 0).text().strip().casefold(): row
+            for row in range(self.tableWidget_test_scenarios.rowCount())
+        }
+        for definition in physical:
+            key = definition["name"].casefold()
+            if key in existing_rows:
+                row = existing_rows[key]
+                path_item = self.tableWidget_test_scenarios.item(row, 1)
+                if not path_item.text().strip():
+                    path_item.setText(definition["path"])
+            else:
+                self.add_test_scenario_row(definition["name"], definition["path"])
         if not self.lineEdit_test_report_path.text().strip():
             self.lineEdit_test_report_path.setText(str((root / "Отчет_тестирования").resolve()))
-        has_missing_paths = any(
-            not self.tableWidget_test_scenarios.item(row, 1).text().strip()
-            for row in range(self.tableWidget_test_scenarios.rowCount())
-        )
-        if offer_restore and has_missing_paths:
+        if offer_restore and not physical and any(
+            definition.get("prefix") for definition in definitions
+        ):
             self.restore_test_scenarios_from_names(
                 ask_before_apply=True, silent_if_unavailable=True
             )
 
+    def ask_confirmation(self, title, text, informative_text="",
+                         icon=QMessageBox.Question):
+        """Показывает единообразное подтверждение с выбранной кнопкой «Да»."""
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle(title)
+        dialog.setText(text)
+        dialog.setIcon(icon)
+        if informative_text:
+            dialog.setInformativeText(informative_text)
+
+        yes_button = dialog.addButton("Да", QMessageBox.YesRole)
+        no_button = dialog.addButton("Нет", QMessageBox.NoRole)
+        yes_button.setAutoDefault(True)
+        no_button.setAutoDefault(True)
+        yes_button.setDefault(True)
+        dialog.setDefaultButton(yes_button)
+        dialog.setEscapeButton(no_button)
+
+        # QMessageBox назначает фокус во время показа, поэтому возвращаем его
+        # после открытия окна. Так выделение видно и Enter всегда означает «Да».
+        def focus_yes_button():
+            yes_button.setFocus(Qt.OtherFocusReason)
+            yes_button.setDefault(True)
+
+        QTimer.singleShot(0, focus_yes_button)
+        dialog.exec_()
+        return dialog.clickedButton() is yes_button
+
     def restore_test_scenarios_from_names(self, _checked=False, ask_before_apply=True,
                                           silent_if_unavailable=False):
-        """Создает неизменяющее исходники сценарное представление плоского test split."""
+        """Настраивает правила и создаёт сценарное представление плоского test split."""
         root_text = self.ui.lineEdit_dataset_path.text().strip()
         if not root_text or not Path(root_text).is_dir():
             QMessageBox.warning(
@@ -1070,80 +1404,17 @@ class MainWindow(QMainWindow):
                 "Сначала выберите корень Roboflow-датасета в верхней части окна."
             )
             return False
-        try:
-            output, plan, unknown, missing_labels = build_plan(root_text, None)
-        except ValueError as exc:
-            if not silent_if_unavailable:
-                QMessageBox.warning(self, "Невозможно восстановить сценарии", str(exc))
+        definitions = prepare_scenario_folders(
+            self,
+            root_text,
+            icon_path,
+            output_path=Path(root_text).resolve() / "test_scenarios",
+        )
+        if definitions is None:
             return False
-        if not plan:
-            if not silent_if_unavailable:
-                QMessageBox.information(
-                    self, "Сценарии не найдены",
-                    "В именах изображений не найдены префиксы afternoon, night, twilight, fog или fallout."
-                )
-            return False
-
-        counts = Counter(destination.parents[1].name for _, destination in plan[::2])
-        count_text = "\n".join(
-            f"• {display_scenario(name)}: {count} изображений"
-            for name, count in sorted(counts.items())
-        )
-        details = (
-            f"По именам файлов найдены сценарии:\n{count_text}\n\n"
-            f"Будет создано отдельное представление:\n{output}\n\n"
-            "Исходные train, valid и test не изменятся. Сначала используются жесткие ссылки; "
-            "если они недоступны, файлы будут скопированы."
-        )
-        if unknown:
-            details += f"\n\nНе распознано и будет пропущено изображений: {len(unknown)}."
-        if missing_labels:
-            details += f"\nНе найдено разметок и будет пропущено изображений: {len(missing_labels)}."
-
-        if ask_before_apply:
-            dialog = QMessageBox(self)
-            dialog.setWindowTitle("Восстановить сценарии")
-            dialog.setText(details)
-            dialog.setIcon(QMessageBox.Question)
-            yes_button = dialog.addButton("Да", QMessageBox.YesRole)
-            dialog.addButton("Нет", QMessageBox.NoRole)
-            dialog.setDefaultButton(yes_button)
-            dialog.exec_()
-            if dialog.clickedButton() is not yes_button:
-                return False
-        progress = QtWidgets.QProgressDialog(
-            "Восстановление папок сценариев…", "", 0, len(plan), self
-        )
-        progress.setWindowTitle("Подготовка тестовой выборки")
-        progress.setCancelButton(None)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        def update_restore_progress(current, total):
-            if current == total or current % 25 == 0:
-                progress.setValue(current)
-                QtWidgets.QApplication.processEvents()
-
-        try:
-            status = apply_plan(
-                plan,
-                strategy="hardlink",
-                fallback_to_copy=True,
-                progress_callback=update_restore_progress,
-            )
-        except (OSError, FileExistsError) as exc:
-            QMessageBox.critical(self, "Не удалось восстановить сценарии", str(exc))
-            return False
-        finally:
-            progress.close()
-
-        # После создания повторно заполняем таблицу, но уже без нового вопроса.
-        self.suggest_test_scenario_paths(offer_restore=False)
-        created = status["created"] + status["copied"]
-        QMessageBox.information(
-            self, "Сценарии восстановлены",
-            f"Готово. Создано файлов: {created}; уже существовало: {status['skipped']}.\n\n{output}"
-        )
+        self.tableWidget_test_scenarios.setRowCount(0)
+        for definition in definitions:
+            self.add_test_scenario_row(definition["name"], definition["path"])
         return True
 
     def configured_test_scenarios(self):
@@ -1181,6 +1452,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.save_current_labels()
+        if (
+            self.dataset_statistics_worker
+            and self.dataset_statistics_worker.isRunning()
+        ):
+            self.dataset_statistics_worker.wait()
         event.accept()
 
     def set_boxes_interactive(self, enabled: bool):
@@ -1274,7 +1550,7 @@ class MainWindow(QMainWindow):
         self.img_count = len(self.image_items)
         self.current_index = 0
         if not self.image_items:
-            self.ui.label_img_num.setText("Изображение 0/0")
+            self.update_image_number_controls()
             self.set_annotation_controls_enabled(False)
             QMessageBox.information(
                 self,
@@ -1338,7 +1614,7 @@ class MainWindow(QMainWindow):
 
     def place_img(self, img_path, label_path=None):
         # print(img_path)
-        self.ui.label_img_num.setText(f"Изображение {self.current_index + 1} / {self.img_count} ({os.path.basename(img_path)})")
+        self.update_image_number_controls(img_path)
         self.view = self.ui.graphicsView
 
         if not self.scene:
@@ -1393,11 +1669,15 @@ class MainWindow(QMainWindow):
                 self.configure_source_panel("dataset_edit")
 
     def choose_model_path(self):
+        section = getattr(self, "current_section", "training")
+        if section not in ("training", "testing"):
+            section = "training"
+        profile = get_model_profile(self.selected_model_profile_id(section))
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите модель детекции",
             os.getcwd(),
-            "Модели детекции (*.pt *.onnx *.engine *.torchscript);;Все файлы (*)"
+            profile.file_filter + ";;Все файлы (*)"
         )
         if file_path:
             self.ui.lineEdit_model_path.setText(file_path)
@@ -1546,6 +1826,21 @@ class MainWindow(QMainWindow):
             msg.setText("Необходимо выделить разметку для удаления!")
             msg.setIcon(QMessageBox.Information)
             msg.exec_()  # показывает окно
+
+    def delete_selection_or_image(self):
+        """Delete удаляет выделенные рамки, а при их отсутствии — изображение."""
+        if self.ui.stackedWidget.currentIndex() != 2:
+            return
+        selected_boxes = []
+        if self.scene:
+            selected_boxes = [
+                item for item in self.scene.selectedItems()
+                if isinstance(item, BBoxItem)
+            ]
+        if selected_boxes:
+            self.delete_selected_boxes()
+        else:
+            self.delete_current_image()
 
     def edit_selected_boxes(self):
         selected = False
@@ -1785,19 +2080,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Применить ко всей папке")
-        dialog.setIcon(QMessageBox.Question)
-        dialog.setText(
+        if not self.ask_confirmation(
+            "Применить ко всей папке",
             f"Добавить выделенные рамки ({len(selected_lines)}) ко всем изображениям "
             f"текущей папки ({len(self.image_items)})?\n\n"
-            "Существующая разметка сохранится, точные дубликаты добавлены не будут."
-        )
-        apply_button = dialog.addButton("Применить", QMessageBox.AcceptRole)
-        cancel_button = dialog.addButton("Отмена", QMessageBox.RejectRole)
-        dialog.setDefaultButton(cancel_button)
-        dialog.exec_()
-        if dialog.clickedButton() is not apply_button:
+            "Существующая разметка сохранится, точные дубликаты добавлены не будут.",
+        ):
             return
 
         self.save_current_labels()
@@ -1880,15 +2168,10 @@ class MainWindow(QMainWindow):
             return
         if not self.current_annotation_lines():
             return
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Удалить всю разметку")
-        dialog.setText("Удалить все рамки с текущего изображения?")
-        dialog.setIcon(QMessageBox.Question)
-        yes_button = dialog.addButton("Да", QMessageBox.YesRole)
-        dialog.addButton("Нет", QMessageBox.NoRole)
-        dialog.setDefaultButton(yes_button)
-        dialog.exec_()
-        if dialog.clickedButton() is yes_button:
+        if self.ask_confirmation(
+            "Удалить всю разметку",
+            "Удалить все рамки с текущего изображения?",
+        ):
             self.undo_stack.push(
                 ReplaceAnnotationsCommand(
                     self,
@@ -1898,19 +2181,67 @@ class MainWindow(QMainWindow):
                 )
             )
 
+    def delete_current_image(self):
+        """Убирает текущую пару image/label из датасета и показывает соседний файл."""
+        if self.ui.stackedWidget.currentIndex() != 2 or not self.image_items:
+            return
+        if not 0 <= self.current_index < len(self.image_items):
+            return
+
+        image_path, label_path = self.image_items[self.current_index]
+        if not self.ask_confirmation(
+            "Удалить изображение из датасета",
+            f"Удалить из датасета изображение «{Path(image_path).name}»?",
+            informative_text=(
+                "Изображение и файл разметки будут перемещены в папку "
+                "<b>.marking_trash</b> текущего раздела датасета."
+            ),
+            icon=QMessageBox.Warning,
+        ):
+            return
+
+        try:
+            _moved_image, _moved_label, trash_root = move_annotation_pair_to_trash(
+                image_path, label_path
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(
+                self, "Не удалось удалить изображение",
+                f"Файлы датасета не были изменены.\n\n{exc}",
+            )
+            return
+
+        removed_index = self.current_index
+        self.image_items.pop(removed_index)
+        self.img_count = len(self.image_items)
+        self.undo_stack.clear()
+
+        if self.image_items:
+            self.current_index = min(removed_index, self.img_count - 1)
+            next_image, next_label = self.image_items[self.current_index]
+            self.place_img(next_image, next_label)
+        else:
+            self.current_index = 0
+            self.current_label_path = None
+            self.item = None
+            if self.scene:
+                self.scene.clear()
+            self.box_items.clear()
+            self.update_image_number_controls()
+            self.set_annotation_controls_enabled(False)
+
+        self.statusBar().showMessage(
+            f"Изображение удалено из датасета. Корзина: {trash_root}", 8000
+        )
+
     def reset_current_labels(self):
         if not self.item:
             return
 
-        reply = QMessageBox.question(
-            self,
+        if not self.ask_confirmation(
             "Сброс изменений",
             "Все несохранённые изменения будут потеряны.\nПродолжить?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-
-        if reply != QMessageBox.Yes:
+        ):
             return
 
         # просто заново загружаем текущее изображение
@@ -2246,11 +2577,18 @@ class MainWindow(QMainWindow):
         details = list(analysis.get("details", []))
         if analysis.get("report_path"):
             details.extend(("", f"Отчет: {analysis['report_path']}"))
+        if analysis.get("dataset_report_path"):
+            details.append(
+                f"Статистика датасета: {analysis['dataset_report_path']}"
+            )
         dialog.setDetailedText("\n".join(details))
         dialog.addButton("Закрыть", QMessageBox.AcceptRole)
         dialog.exec_()
 
     def start_training(self):
+        model_profile_id = self.require_selected_model_backend("training")
+        if model_profile_id is None:
+            return
         model_path = self.ui.lineEdit_model_path.text().strip()
         if not os.path.exists(model_path):
             QMessageBox.warning(
@@ -2287,12 +2625,14 @@ class MainWindow(QMainWindow):
         self.active_process_kind = "training"
 
         self.yoloWorker.start_training(
+            model_profile_id=model_profile_id,
             model_path=model_path,
             dataset_yaml=yaml_path,
             epochs=epochs,
             imgsz=int(self.ui.comboBox.currentText()),
             batch=self.ui.spinBox_batch.value(),
-            gpu=self.ui.checkBox_gpu.isChecked()
+            gpu=self.ui.checkBox_gpu.isChecked(),
+            dataset_root=self.ui.lineEdit_dataset_path.text().strip(),
         )
 
         self.timer.start(100)  # 10 раз в секунду
@@ -2331,6 +2671,9 @@ class MainWindow(QMainWindow):
         self.ui.progressBar_testing.setFormat(f"{name} ({index}/{total}) — %p%")
 
     def start_model_test(self):
+        model_profile_id = self.require_selected_model_backend("testing")
+        if model_profile_id is None:
+            return
         model_path = self.ui.lineEdit_model_path.text()
         if not os.path.exists(model_path):
             QMessageBox.warning(self, "Не выбрана модель", "Укажите существующий файл модели.")
@@ -2367,7 +2710,7 @@ class MainWindow(QMainWindow):
 
         self.load_classes(yaml_path)
 
-        self.yoloWorker = YOLOTestWorker()
+        self.yoloWorker = ModelTestWorker()
 
         self.yoloWorker.progress.connect(self.ui.progressBar_testing.setValue)
         self.yoloWorker.log.connect(self.on_testing_log)
@@ -2378,6 +2721,7 @@ class MainWindow(QMainWindow):
         self.ui.progressBar_testing.setVisible(True)
 
         self.yoloWorker.start_evaluation(
+            model_profile_id=model_profile_id,
             model_path=model_path,
             scenarios=scenarios,
             report_dir=report_dir,

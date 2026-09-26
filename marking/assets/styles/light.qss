@@ -88,6 +88,14 @@ QPushButton:pressed {
     background-color: #dfedfc;
 }
 
+/* Подсветка следует за клавиатурным фокусом между «Да» и «Нет». */
+QMessageBox QPushButton:focus {
+    color: #ffffff;
+    background-color: #2f80ed;
+    border: 2px solid #175ca8;
+    font-weight: 600;
+}
+
 QPushButton:disabled {
     color: #a3adba;
     background-color: #f1f4f8;

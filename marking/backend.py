@@ -11,6 +11,8 @@ import traceback
 import multiprocessing as mp
 from training_progress import calculate_training_progress
 from training_analysis import analyze_training_results, save_training_analysis
+from model_catalog import create_model_runtime, get_model_profile
+from dataset_statistics import generate_dataset_statistics_report
 
 
 def model_autolabel_process(
@@ -27,7 +29,10 @@ def model_autolabel_process(
         model = create_detection_adapter(model_path)
 
         root_folder = Path(root_folder)
-        image_folders = list(root_folder.rglob("images"))
+        image_folders = [
+            folder for folder in root_folder.rglob("images")
+            if ".marking_trash" not in folder.parts
+        ]
 
         if not image_folders:
             queue.put(("error", "Папок images не найдено!", ""))
@@ -101,10 +106,12 @@ def model_autolabel_process(
         queue.put(("error", str(e), traceback.format_exc()))
 
 
-def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gpu):
+def model_train_process(
+    queue, model_profile_id, model_path, dataset_yaml, epochs, imgsz, batch, gpu,
+    dataset_root=None,
+):
     import torch
     import traceback
-    from ultralytics import YOLO
 
     success = False
     try:
@@ -114,7 +121,9 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
         else:
             device = "cpu"
 
-        model = YOLO(model_path)
+        profile = get_model_profile(model_profile_id)
+        queue.put(("log", f"Архитектура: {profile.display_name}; backend: {profile.backend_id}"))
+        model = create_model_runtime(model_profile_id, model_path)
 
         """
         data - файл конфигурации датасета, в нем указаны пути к изображениям,
@@ -193,11 +202,26 @@ def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gp
             workers=workers
         )
         success = True
+        run_dir = Path(model.trainer.save_dir)
+        dataset_report_path = ""
         try:
-            run_dir = Path(model.trainer.save_dir)
+            _, dataset_report_path = generate_dataset_statistics_report(
+                dataset_root or Path(dataset_yaml).parent,
+                output_path=run_dir / "Статистика_датасета.xlsx",
+                yaml_path=dataset_yaml,
+            )
+            dataset_report_path = str(dataset_report_path)
+            queue.put(("log", f"Статистика датасета сохранена: {dataset_report_path}"))
+        except Exception as statistics_error:
+            queue.put((
+                "log",
+                f"Обучение завершено, но статистику датасета сохранить не удалось: {statistics_error}",
+            ))
+        try:
             analysis = analyze_training_results(run_dir / "results.csv")
             analysis["report_path"] = str(save_training_analysis(run_dir, analysis))
             analysis["run_dir"] = str(run_dir)
+            analysis["dataset_report_path"] = dataset_report_path
             queue.put(("training_analysis", analysis))
         except Exception as analysis_error:
             queue.put((
@@ -242,25 +266,29 @@ class ModelWorker(QObject):
 
     def start_training(
         self,
+        model_profile_id,
         model_path,
         dataset_yaml,
         epochs,
         imgsz,
         batch,
-        gpu
+        gpu,
+        dataset_root=None,
     ):
         self.queue = mp.Queue()
 
         self.process = mp.Process(
-            target=yolo_train_process,
+            target=model_train_process,
             args=(
                 self.queue,  # очередь первой
+                model_profile_id,
                 model_path,  # потом модель
                 dataset_yaml,
                 epochs,
                 imgsz,
                 batch,
-                gpu
+                gpu,
+                dataset_root,
             ),
             daemon=False
         )
@@ -369,7 +397,10 @@ class ModelWorker(QObject):
 
         try:
             root_folder = Path(root_folder)
-            image_folders = list(root_folder.rglob("images"))
+            image_folders = [
+                folder for folder in root_folder.rglob("images")
+                if ".marking_trash" not in folder.parts
+            ]
 
             if not image_folders:
                 self.log.emit("Папок images не найдено!")
@@ -469,6 +500,13 @@ class ModelWorker(QObject):
 
         finally:
             self.finished.emit(True)
+
+
+# Старые имена оставлены для совместимости с внешними вызовами.
+def yolo_train_process(queue, model_path, dataset_yaml, epochs, imgsz, batch, gpu):
+    return model_train_process(
+        queue, "yolov12s", model_path, dataset_yaml, epochs, imgsz, batch, gpu
+    )
 
 
 # Compatibility for external code written against the old public name.

@@ -271,7 +271,8 @@ def save_pr_figure(scenario: str, curves: dict[str, tuple[np.ndarray, np.ndarray
 
 def write_report(report_dir: Path, model_path: str, imgsz: int, device_name: str,
                  scenario_results: list[dict], dataset_class_names=None,
-                 model_class_names=None, ultralytics_version="") -> Path:
+                 model_class_names=None, ultralytics_version="",
+                 model_profile_name="") -> Path:
     """Создает одну книгу Excel и по одному PR-графику на сценарий."""
     report_dir = Path(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -302,6 +303,7 @@ def write_report(report_dir: Path, model_path: str, imgsz: int, device_name: str
 
     parameters = [
         ("Дата формирования", datetime.now().strftime("%d.%m.%Y %H:%M")),
+        ("Архитектура", model_profile_name or "Не указана"),
         ("Модель", str(Path(model_path).resolve())),
         ("Размер изображения", imgsz), ("Устройство", device_name), ("Сценариев", len(scenario_results)),
         ("Порог confidence", 0.001), ("Порог NMS IoU", 0.5),

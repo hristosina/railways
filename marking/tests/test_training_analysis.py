@@ -15,6 +15,24 @@ def write_history(path, train_values, val_values, map_values):
 
 
 class TrainingAnalysisTests(unittest.TestCase):
+    def test_accepts_rtdetr_localization_losses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.csv"
+            with path.open("w", encoding="utf-8", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow((
+                    "epoch", "train/giou_loss", "train/l1_loss",
+                    "val/giou_loss", "val/l1_loss", "metrics/mAP50-95(B)",
+                ))
+                for index in range(30):
+                    writer.writerow((index + 1, 1 - index * .01, .5 - index * .005,
+                                     1.2 - index * .01, .6 - index * .005,
+                                     .2 + index * .01))
+            analysis = analyze_training_results(path)
+            self.assertEqual(analysis["verdict"], "continue")
+            self.assertTrue(any("giou_loss + l1_loss" in line
+                                for line in analysis["details"]))
+
     def test_recommends_more_epochs_when_both_losses_fall(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.csv"

@@ -1,4 +1,4 @@
-"""Понятный пользователю анализ динамики обучения Ultralytics."""
+"""Понятный пользователю анализ динамики обучения моделей детекции."""
 
 from __future__ import annotations
 
@@ -6,7 +6,13 @@ import csv
 from pathlib import Path
 
 
-REQUIRED_COLUMNS = ("epoch", "train/box_loss", "val/box_loss")
+LOSS_COLUMN_PAIRS = (
+    (("train/box_loss",), ("val/box_loss",), "box_loss"),
+    # RT-DETR раздельно записывает GIoU и L1. Их сумма отражает динамику
+    # локализации и сопоставима по смыслу с box_loss, но не по абсолютной шкале.
+    (("train/giou_loss", "train/l1_loss"),
+     ("val/giou_loss", "val/l1_loss"), "giou_loss + l1_loss"),
+)
 
 
 def _mean(values):
@@ -30,13 +36,26 @@ def load_training_history(results_csv):
         if reader.fieldnames is None:
             raise ValueError("Файл результатов обучения пуст.")
         normalized = {name.strip(): name for name in reader.fieldnames}
-        missing = [name for name in REQUIRED_COLUMNS if name not in normalized]
-        if missing:
-            raise ValueError("В results.csv отсутствуют столбцы: " + ", ".join(missing))
+        if "epoch" not in normalized:
+            raise ValueError("В results.csv отсутствует столбец epoch.")
+        loss_columns = next((pair for pair in LOSS_COLUMN_PAIRS
+                             if all(name in normalized for name in (*pair[0], *pair[1]))), None)
+        if loss_columns is None:
+            supported = " или ".join(
+                "+".join((*train_names, *val_names))
+                for train_names, val_names, _label in LOSS_COLUMN_PAIRS
+            )
+            raise ValueError("Не найдены поддерживаемые столбцы ошибок: " + supported)
         rows = []
         for source_row in reader:
             try:
-                rows.append({name.strip(): float(value) for name, value in source_row.items() if value not in (None, "")})
+                row = {name.strip(): float(value) for name, value in source_row.items()
+                       if value not in (None, "")}
+                train_names, val_names, label = loss_columns
+                row["train/localization_loss"] = sum(row[name] for name in train_names)
+                row["val/localization_loss"] = sum(row[name] for name in val_names)
+                row["localization_loss_name"] = label
+                rows.append(row)
             except ValueError:
                 continue
     return rows
@@ -55,8 +74,9 @@ def analyze_training_results(results_csv):
         }
 
     epochs = [int(row["epoch"]) for row in rows]
-    train_loss = [row["train/box_loss"] for row in rows]
-    val_loss = [row["val/box_loss"] for row in rows]
+    train_loss = [row["train/localization_loss"] for row in rows]
+    val_loss = [row["val/localization_loss"] for row in rows]
+    loss_name = rows[0]["localization_loss_name"]
     map_column = "metrics/mAP50-95(B)"
     map_values = [row[map_column] for row in rows] if all(map_column in row for row in rows) else None
     window = min(20, max(5, len(rows) // 5))
@@ -126,9 +146,9 @@ def analyze_training_results(results_csv):
 
     details = [
         f"Проанализировано эпох: {len(rows)} (окно: последние {window})",
-        f"train/box_loss: {train_recent:.4f}, изменение {train_change:+.1f}%",
-        f"val/box_loss: {val_recent:.4f}, изменение {val_change:+.1f}%",
-        f"Минимальный val/box_loss: {best_val:.4f} на эпохе {best_val_epoch}",
+        f"train/{loss_name}: {train_recent:.4f}, изменение {train_change:+.1f}%",
+        f"val/{loss_name}: {val_recent:.4f}, изменение {val_change:+.1f}%",
+        f"Минимальный val/{loss_name}: {best_val:.4f} на эпохе {best_val_epoch}",
         f"Разрыв val/train: {generalization_gap:.2f}×",
     ]
     if map_values:
