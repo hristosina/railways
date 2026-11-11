@@ -8,6 +8,7 @@ UI оперирует идентификатором профиля, а не и�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 
@@ -25,10 +26,17 @@ class ModelProfile:
     file_filter: str
     description: str
     backend_hint: str = ""
+    rknn_status: str = "Требуется экспериментальная проверка экспорта и инференса."
 
     @property
     def available(self) -> bool:
-        return self.backend_id in _BACKEND_FACTORIES
+        if self.backend_id in _BACKEND_FACTORIES:
+            return True
+        try:
+            from external_model_backend import external_backend_ready
+            return external_backend_ready(self.backend_id)[0]
+        except Exception:
+            return False
 
 
 MODEL_PROFILES = (
@@ -40,6 +48,7 @@ MODEL_PROFILES = (
         default_artifact="yolov8s.pt",
         file_filter="Модели Ultralytics (*.pt *.yaml *.onnx *.engine *.torchscript)",
         description="Сверточный anchor-free детектор семейства YOLOv8, масштаб small.",
+        rknn_status="Кандидат для экспорта в RKNN; совместимость проверяется на целевом устройстве.",
     ),
     ModelProfile(
         id="yolov12s",
@@ -49,40 +58,54 @@ MODEL_PROFILES = (
         default_artifact="yolov12s.pt",
         file_filter="Модели Ultralytics (*.pt *.yaml *.onnx *.engine *.torchscript)",
         description="YOLOv12 в масштабе small с механизмами внимания.",
+        rknn_status="Кандидат для экспорта в RKNN; операции внимания требуют проверки конвертером.",
     ),
     ModelProfile(
-        id="rtdetr",
-        display_name="RT-DETR",
-        paradigm="Transformer",
-        backend_id="ultralytics-rtdetr",
-        default_artifact="rtdetr-l.pt",
-        file_filter="Модели RT-DETR (*.pt *.yaml *.onnx *.engine)",
-        description="Трансформерный end-to-end детектор без NMS.",
-    ),
-    ModelProfile(
-        id="rtdetrv2",
-        display_name="RT-DETRv2",
-        paradigm="Transformer",
-        backend_id="rtdetrv2",
-        default_artifact="checkpoint.pth",
-        file_filter="Веса RT-DETRv2 (*.pth *.pt);;Конфигурации (*.yml *.yaml *.json)",
-        description="Усовершенствованная версия RT-DETR.",
+        id="rtdetr_r18",
+        display_name="RT-DETR-R18",
+        paradigm="Compact Transformer",
+        backend_id="official-rtdetr-r18",
+        default_artifact="rtdetr_r18vd_dec3_6x_coco_from_paddle.pth",
+        file_filter="Веса RT-DETR-R18 (*.pth);;Конфигурации RT-DETR (*.yml *.yaml)",
+        description="Облегченный RT-DETR с backbone ResNet-18 (20 млн параметров).",
         backend_hint=(
-            "Для RT-DETRv2 требуется отдельный адаптер официальной реализации: "
-            "ее формат конфигурации и контрольных точек несовместим с Ultralytics."
+            "Для RT-DETR-R18 используется официальная реализация lyuwenyu/RT-DETR "
+            "в изолированном окружении venv310. Если проверка не проходит, запустите "
+            "install_model_backends.bat."
         ),
+        rknn_status="Не подтверждено: требуется проверка ONNX-графа на RKNN Toolkit2.",
     ),
     ModelProfile(
-        id="dino",
-        display_name="DINO (DETR)",
-        paradigm="Transformer",
-        backend_id="dino",
-        default_artifact="checkpoint.pth",
-        file_filter="Веса DINO (*.pth *.pt);;Конфигурации (*.py *.yaml *.yml)",
-        description="DINO с denoising-обучением и инициализацией anchor-запросов.",
+        id="rtdetrv2_s",
+        display_name="RT-DETRv2-S",
+        paradigm="Compact Transformer",
+        backend_id="official-rtdetrv2-s",
+        default_artifact="rtdetrv2_r18vd_120e_coco_rerun_48.1.pth",
+        file_filter="Веса RT-DETRv2-S (*.pth);;Конфигурации RT-DETRv2 (*.yml *.yaml)",
+        description="Улучшенный компактный RT-DETRv2-S (20 млн параметров).",
         backend_hint=(
-            "Для DINO требуется отдельный адаптер официальной реализации или detrex; "
-            "это не модель Grounding DINO."
+            "Для RT-DETRv2-S используется официальный rtdetrv2_pytorch в "
+            "изолированном окружении venv310. Если проверка не проходит, запустите "
+            "install_model_backends.bat."
+        ),
+        rknn_status="Не подтверждено: требуется проверка ONNX-графа на RKNN Toolkit2.",
+    ),
+    ModelProfile(
+        id="rfdetr_nano",
+        display_name="RF-DETR-Nano",
+        paradigm="Compact Transformer",
+        backend_id="rfdetr-nano",
+        default_artifact="rf-detr-nano.pth (скачается автоматически)",
+        file_filter="Веса RF-DETR-Nano (*.pth *.ckpt)",
+        description="Компактный RF-DETR Nano примерно на 10 млн параметров.",
+        backend_hint=(
+            "RF-DETR-Nano работает через изолированное окружение venv310 с "
+            "совместимыми версиями RF-DETR, Transformers и CUDA PyTorch. Если "
+            "проверка не проходит, запустите install_model_backends.bat."
+        ),
+        rknn_status=(
+            "Не подтверждено: официальный экспорт поддерживает ONNX, но итоговый "
+            "граф необходимо отдельно проверить в RKNN Toolkit2."
         ),
     ),
 )
@@ -109,11 +132,32 @@ def available_model_profiles() -> tuple[ModelProfile, ...]:
     return MODEL_PROFILES
 
 
+def infer_model_profile_from_artifact(artifact_path: str | Path) -> str | None:
+    """Определяет профиль по стандартному пути runs/<profile_id>/... ."""
+    parts = {part.casefold() for part in Path(artifact_path).parts}
+    for profile in MODEL_PROFILES:
+        if profile.id.casefold() in parts:
+            return profile.id
+    return None
+
+
 def model_profile_status(profile_id: str) -> tuple[bool, str]:
     profile = get_model_profile(profile_id)
     if profile.available:
-        return True, f"Backend: {profile.backend_id}. {profile.description}"
-    return False, profile.backend_hint or f"Backend {profile.backend_id!r} не подключен."
+        return True, (
+            f"Backend: {profile.backend_id}. {profile.description} "
+            f"RKNN: {profile.rknn_status}"
+        )
+    try:
+        from external_model_backend import external_backend_ready
+        _ready, runtime_status = external_backend_ready(profile.backend_id)
+    except Exception:
+        runtime_status = ""
+    backend_status = " ".join(filter(None, (
+        profile.backend_hint or f"Backend {profile.backend_id!r} не подключен.",
+        runtime_status,
+    )))
+    return False, f"{backend_status} RKNN: {profile.rknn_status}"
 
 
 def create_model_runtime(profile_id: str, artifact_path: str):
@@ -134,11 +178,4 @@ def _create_ultralytics_yolo(path: str):
     return YOLO(path)
 
 
-def _create_ultralytics_rtdetr(path: str):
-    from ultralytics import RTDETR
-
-    return RTDETR(path)
-
-
 register_model_backend("ultralytics-yolo", _create_ultralytics_yolo)
-register_model_backend("ultralytics-rtdetr", _create_ultralytics_rtdetr)

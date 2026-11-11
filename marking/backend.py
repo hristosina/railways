@@ -1,18 +1,52 @@
 from pathlib import Path
+from datetime import datetime
 
 from PyQt5.QtCore import QObject, pyqtSignal
-from ultralytics import YOLO
 
 import os
+import subprocess
 import shutil
 import yaml
-import torch
 import traceback
 import multiprocessing as mp
 from training_progress import calculate_training_progress
 from training_analysis import analyze_training_results, save_training_analysis
+from training_metadata import save_training_parameters
 from model_catalog import create_model_runtime, get_model_profile
 from dataset_statistics import generate_dataset_statistics_report
+
+
+def recommended_dataloader_workers(cpu_count=None, platform_name=None):
+    """Возвращает безопасное число процессов загрузки данных.
+
+    На Windows каждый worker создается через spawn и заново загружает PyTorch и
+    CUDA DLL. При пересоздании dataloader перед отключением mosaic это может
+    исчерпать файл подкачки. Нулевое значение оставляет загрузку в основном
+    процессе и исключает повторный импорт CUDA в дочерних процессах.
+    """
+    cpu_count = int(cpu_count or os.cpu_count() or 1)
+    platform_name = platform_name or os.name
+    if platform_name == "nt":
+        return 0
+    return min(8, max(1, cpu_count // 2))
+
+
+def build_training_arguments(
+    *, dataset_yaml, epochs, imgsz, batch, device, workers, patience, resume
+):
+    """Формирует аргументы backend-а без сброса состояния при resume."""
+    arguments = {
+        "imgsz": imgsz,
+        "batch": batch,
+        "device": device,
+        "workers": workers,
+        "patience": patience,
+    }
+    if resume:
+        arguments["resume"] = True
+    else:
+        arguments.update({"data": dataset_yaml, "epochs": epochs})
+    return arguments
 
 
 def model_autolabel_process(
@@ -108,21 +142,43 @@ def model_autolabel_process(
 
 def model_train_process(
     queue, model_profile_id, model_path, dataset_yaml, epochs, imgsz, batch, gpu,
-    dataset_root=None,
+    dataset_root=None, patience=30, resume=False,
 ):
-    import torch
     import traceback
 
     success = False
     try:
+        profile = get_model_profile(model_profile_id)
+        if profile.backend_id != "ultralytics-yolo":
+            from external_model_backend import run_external_backend
+
+            queue.put(("log", f"Запуск backend-а {profile.backend_id} в Python 3.10…"))
+            success = run_external_backend(queue, "train", {
+                "profile_id": profile.id,
+                "model_display_name": profile.display_name,
+                "model_paradigm": profile.paradigm,
+                "backend_id": profile.backend_id,
+                "model_path": model_path,
+                "dataset_yaml": dataset_yaml,
+                "dataset_root": dataset_root or str(Path(dataset_yaml).parent),
+                "epochs": int(epochs),
+                "imgsz": int(imgsz),
+                "batch": int(batch),
+                "gpu": bool(gpu),
+                "patience": int(patience),
+                "resume": bool(resume),
+            })
+            if not success:
+                raise RuntimeError(f"Backend {profile.backend_id} завершился с ошибкой.")
+            return
+
+        import torch
         if torch.cuda.is_available() and gpu:
             device = 0
             print(f"GPU доступен: {torch.cuda.get_device_name(device)}")
         else:
             device = "cpu"
 
-        profile = get_model_profile(model_profile_id)
-        queue.put(("log", f"Архитектура: {profile.display_name}; backend: {profile.backend_id}"))
         model = create_model_runtime(model_profile_id, model_path)
 
         """
@@ -148,6 +204,52 @@ def model_train_process(
         """
 
         progress_state = {"epoch_index": None, "batch_number": 0, "last_payload": None}
+
+        workers = recommended_dataloader_workers()
+        if os.name == "nt" and workers == 0:
+            queue.put((
+                "log",
+                "Windows: загрузчики данных работают в основном процессе "
+                "(workers=0), чтобы не исчерпать файл подкачки при загрузке CUDA.",
+            ))
+        if resume:
+            queue.put((
+                "log",
+                "Продолжение обучения из checkpoint с восстановлением эпохи, "
+                "оптимизатора и расписания learning rate.",
+            ))
+        started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        requested_parameters = {
+            "model_profile_id": profile.id,
+            "model_display_name": profile.display_name,
+            "model_paradigm": profile.paradigm,
+            "backend_id": profile.backend_id,
+            "model_path": str(Path(model_path).resolve()),
+            "dataset_root": str(Path(dataset_root or Path(dataset_yaml).parent).resolve()),
+            "dataset_yaml": str(Path(dataset_yaml).resolve()),
+            "epochs": int(epochs),
+            "imgsz": int(imgsz),
+            "batch": int(batch),
+            "patience": int(patience),
+            "gpu": bool(gpu),
+            "device": device,
+            "workers": workers,
+            "resume": bool(resume),
+        }
+        def save_started_parameters(trainer):
+            try:
+                save_training_parameters(
+                    trainer.save_dir,
+                    requested_parameters,
+                    trainer=trainer,
+                    status="выполняется",
+                    started_at=started_at,
+                )
+            except Exception as metadata_error:
+                queue.put((
+                    "log",
+                    f"Не удалось сохранить параметры обучения: {metadata_error}",
+                ))
 
         def on_train_batch_end(trainer):
             epoch_index = int(trainer.epoch)
@@ -189,20 +291,41 @@ def model_train_process(
             queue.put(payload)
 
         model.add_callback("on_train_batch_end", on_train_batch_end)
+        model.add_callback("on_train_start", save_started_parameters)
 
-        cpu_cores = os.cpu_count()  # общее количество логических ядер
-        workers = max(1, cpu_cores // 2)  # половина ядер
-
-        model.train(
-            data=dataset_yaml,
+        # При resume Ultralytics берет data, целевое число эпох, optimizer и
+        # scheduler из last.pt. Остальные значения входят в список безопасных
+        # переопределений для восстановления.
+        training_arguments = build_training_arguments(
+            dataset_yaml=dataset_yaml,
             epochs=epochs,
             imgsz=imgsz,
             batch=batch,
             device=device,
-            workers=workers
+            workers=workers,
+            patience=patience,
+            resume=resume,
         )
+        model.train(**training_arguments)
         success = True
         run_dir = Path(model.trainer.save_dir)
+        parameters_path = ""
+        try:
+            completed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            parameters_path = save_training_parameters(
+                run_dir,
+                requested_parameters,
+                trainer=model.trainer,
+                status="завершено",
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+            parameters_path = str(parameters_path)
+        except Exception as metadata_error:
+            queue.put((
+                "log",
+                f"Обучение завершено, но параметры сохранить не удалось: {metadata_error}",
+            ))
         dataset_report_path = ""
         try:
             _, dataset_report_path = generate_dataset_statistics_report(
@@ -221,6 +344,7 @@ def model_train_process(
             analysis = analyze_training_results(run_dir / "results.csv")
             analysis["report_path"] = str(save_training_analysis(run_dir, analysis))
             analysis["run_dir"] = str(run_dir)
+            analysis["training_parameters_path"] = parameters_path
             analysis["dataset_report_path"] = dataset_report_path
             queue.put(("training_analysis", analysis))
         except Exception as analysis_error:
@@ -274,6 +398,8 @@ class ModelWorker(QObject):
         batch,
         gpu,
         dataset_root=None,
+        patience=30,
+        resume=False,
     ):
         self.queue = mp.Queue()
 
@@ -289,11 +415,32 @@ class ModelWorker(QObject):
                 batch,
                 gpu,
                 dataset_root,
+                patience,
+                resume,
             ),
             daemon=False
         )
 
         self.process.start()
+
+    def stop_process_tree(self):
+        """Останавливает worker и все запущенные им backend-процессы."""
+        process = self.process
+        if process is None or not process.is_alive():
+            return
+        if os.name == "nt" and process.pid:
+            # Внешние модели запускаются цепочкой worker -> sidecar -> train.py.
+            # terminate() завершает только worker и оставляет CUDA-процесс жить.
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            process.terminate()
+        process.join(timeout=10)
 
     def start_autolabeling_process(
             self,
@@ -318,12 +465,17 @@ class ModelWorker(QObject):
 
         self.process.start()
 
-    def train(self, dataset_yaml, epochs=50, imgsz=640, batch=4, gpu=True):
+    def train(
+        self, dataset_yaml, epochs=50, imgsz=640, batch=4, gpu=True, patience=30
+    ):
         """
         Обучение модели на указанном датасете.
         Сигналы log и train_info обновляются автоматически.
         """
         try:
+            import torch
+            from ultralytics import YOLO
+
             if self.model is None:
                 self.model = YOLO(self.model_path)
             device = 0 if gpu else 'cpu'
@@ -376,7 +528,9 @@ class ModelWorker(QObject):
                 epochs=epochs,
                 imgsz=imgsz,
                 batch=batch,
-                device=device
+                device=device,
+                workers=recommended_dataloader_workers(),
+                patience=patience,
             )
 
             self.log.emit("Обучение завершено!")

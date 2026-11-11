@@ -32,6 +32,7 @@ from modelTest import ModelTestWorker
 from model_catalog import (
     available_model_profiles,
     get_model_profile,
+    infer_model_profile_from_artifact,
     model_profile_status,
 )
 from evaluation_report import resolve_scenario_directory
@@ -714,8 +715,12 @@ class MainWindow(QMainWindow):
         self.training_analysis = None
         self.dataset_statistics_worker = None
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.poll_queue)
+        # Обучение/авторазметка и тестирование используют разные очереди.
+        # Один общий таймер нельзя переназначать: после тестирования он иначе
+        # продолжает опрашивать старый worker и прогресс обучения замирает на 0.
+        self.background_process_timer = QTimer(self)
+        self.background_process_timer.timeout.connect(self.poll_queue)
+        self.testing_process_timer = QTimer(self)
 
         self.ui.progressBar_class_info.setVisible(False)
         self.ui.tableView_class_info
@@ -821,7 +826,8 @@ class MainWindow(QMainWindow):
         self.ui.pushButton_autolabling.clicked.connect(self.start_autolabling)
 
         self.ui.pushButton_start_training.clicked.connect(self.start_training)
-        self.ui.progressBar_training.setVisible(False)
+        self.setup_training_action_buttons()
+        self.ui.widget.setVisible(False)
 
         self.ui.pushButton_start_model_test.clicked.connect(self.start_model_test)
         self.ui.progressBar_testing.setVisible(False)
@@ -998,23 +1004,59 @@ class MainWindow(QMainWindow):
         self.comboBox_training_model_profile = QtWidgets.QComboBox(
             self.ui.groupBox_training_settings
         )
-        self.label_training_model_status = QtWidgets.QLabel(
+        self.label_training_patience = QtWidgets.QLabel(
+            "Ранняя остановка (patience):",
             self.ui.groupBox_training_settings
         )
-        self.label_training_model_status.setWordWrap(True)
+        self.spinBox_training_patience = QtWidgets.QSpinBox(
+            self.ui.groupBox_training_settings
+        )
+        self.spinBox_training_patience.setRange(0, 500)
+        self.spinBox_training_patience.setValue(30)
+        self.spinBox_training_patience.setSpecialValueText("Отключено")
+        self.checkBox_training_resume = QtWidgets.QCheckBox(
+            "Продолжить прерванное обучение из checkpoint",
+            self.ui.groupBox_training_settings,
+        )
+        patience_tooltip = (
+            "Сколько эпох ждать улучшения метрик на валидационной выборке. "
+            "Если улучшения нет, обучение завершится досрочно. Значение 0 "
+            "отключает раннюю остановку."
+        )
+        self.label_training_patience.setToolTip(patience_tooltip)
+        self.spinBox_training_patience.setToolTip(patience_tooltip)
+        resume_tooltip = (
+            "Включите для точного продолжения прерванного запуска из last.pt: "
+            "будут восстановлены номер эпохи, оптимизатор и learning rate. "
+            "Если флажок снят, выбранные веса используются как начальные для "
+            "нового отдельного дообучения с указанным количеством эпох."
+        )
+        self.checkBox_training_resume.setToolTip(resume_tooltip)
 
         training_rows = (
             (self.ui.label_epochs, self.ui.spinBox_epochs),
             (self.ui.label_imgsz, self.ui.comboBox),
             (self.ui.label_batch, self.ui.spinBox_batch),
+            (self.label_training_patience, self.spinBox_training_patience),
         )
         for row, (label, control) in enumerate(training_rows, start=1):
             self.ui.gridLayout_4.addWidget(label, row, 0)
             self.ui.gridLayout_4.addWidget(control, row, 1)
-        self.ui.gridLayout_4.addWidget(self.ui.checkBox_gpu, 4, 0, 1, 2)
+        self.ui.gridLayout_4.addWidget(
+            self.checkBox_training_resume, 5, 0, 1, 2
+        )
+        self.ui.gridLayout_4.addWidget(self.ui.checkBox_gpu, 6, 0, 1, 2)
         self.ui.gridLayout_4.addWidget(self.label_training_model_profile, 0, 0)
         self.ui.gridLayout_4.addWidget(self.comboBox_training_model_profile, 0, 1)
-        self.ui.gridLayout_4.addWidget(self.label_training_model_status, 5, 0, 1, 2)
+        # Группа настроек растягивается вместе с окном. Отдаем все свободное
+        # место отдельной пустой строке снизу, чтобы поля не разъезжались по
+        # высоте и всегда оставались у верхнего края.
+        for row in range(7):
+            self.ui.gridLayout_4.setRowStretch(row, 0)
+        self.ui.gridLayout_4.setRowStretch(7, 1)
+        self.checkBox_training_resume.toggled.connect(
+            self.update_training_mode_ui
+        )
 
         self.label_testing_model_profile = QtWidgets.QLabel(
             "Архитектура модели:", self.ui.groupBox_test_settings
@@ -1022,18 +1064,24 @@ class MainWindow(QMainWindow):
         self.comboBox_testing_model_profile = QtWidgets.QComboBox(
             self.ui.groupBox_test_settings
         )
-        self.label_testing_model_status = QtWidgets.QLabel(self.ui.groupBox_test_settings)
+        self.label_testing_model_status = QtWidgets.QLabel(
+            self.ui.groupBox_test_settings
+        )
+        self.label_testing_model_status.setObjectName(
+            "label_testing_model_status"
+        )
         self.label_testing_model_status.setWordWrap(True)
-
+        self.label_testing_model_status.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
         for combo in (
             self.comboBox_training_model_profile,
             self.comboBox_testing_model_profile,
         ):
             for profile in profiles:
-                suffix = "" if profile.available else " — требуется backend"
-                combo.addItem(
-                    f"{profile.display_name} · {profile.paradigm}{suffix}", profile.id
-                )
+                combo.addItem(profile.display_name, profile.id)
+                _, status = model_profile_status(profile.id)
+                combo.setItemData(combo.count() - 1, status, Qt.ToolTipRole)
             default_index = combo.findData("yolov12s")
             combo.setCurrentIndex(max(0, default_index))
 
@@ -1045,6 +1093,67 @@ class MainWindow(QMainWindow):
         )
         self.update_model_profile_ui("training")
         self.update_model_profile_ui("testing")
+        self.update_training_mode_ui()
+
+    def setup_training_action_buttons(self):
+        """Размещает штатную остановку рядом с запуском обучения."""
+        self.ui.gridLayout_2.removeWidget(self.ui.pushButton_start_training)
+        self.training_action_container = QtWidgets.QWidget(self.ui.page_2)
+        actions = QtWidgets.QHBoxLayout(self.training_action_container)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        actions.addWidget(self.ui.pushButton_start_training, 3)
+        self.pushButton_stop_training = QtWidgets.QPushButton(
+            "Остановить обучение", self.training_action_container
+        )
+        self.pushButton_stop_training.setToolTip(
+            "Остановить обучение и сохранить checkpoint последней полностью "
+            "завершенной эпохи"
+        )
+        self.pushButton_stop_training.setEnabled(False)
+        actions.addWidget(self.pushButton_stop_training, 1)
+        self.ui.gridLayout_2.addWidget(
+            self.training_action_container, 3, 0, 1, 2
+        )
+        self.pushButton_stop_training.clicked.connect(
+            self.request_stop_training
+        )
+
+    def update_training_mode_ui(self):
+        """Переключает новое обучение и точное восстановление checkpoint."""
+        resume = self.checkBox_training_resume.isChecked()
+        profile = get_model_profile(self.selected_model_profile_id("training"))
+        external_backend = profile.backend_id != "ultralytics-yolo"
+        self.ui.label_epochs.setEnabled(not resume or external_backend)
+        self.ui.spinBox_epochs.setEnabled(not resume or external_backend)
+        if getattr(self, "current_section", None) == "training":
+            self.ui.label_model_path.setText(
+                "Checkpoint прерванного обучения:"
+                if resume else (
+                    "Начальные веса (необязательно):"
+                    if external_backend else "Начальная модель детекции:"
+                )
+            )
+            self.ui.label_source_hint.setText(
+                (
+                    "Выберите checkpoint прерванного запуска и укажите общее "
+                    "целевое число эпох. Состояние оптимизатора будет восстановлено."
+                    if external_backend else
+                    "Выберите checkpoint прерванного запуска. Состояние оптимизатора "
+                    "и номер эпохи будут восстановлены из него."
+                )
+                if resume else
+                (
+                    "Укажите датасет и data.yaml. Если начальные веса не выбраны, "
+                    "официальные предобученные веса скачаются автоматически."
+                    if external_backend else
+                    "Для обучения укажите начальную модель, корень датасета и data.yaml."
+                )
+            )
+        self.ui.pushButton_start_training.setText(
+            "Продолжить обучение"
+            if resume else "Начать обучение модели"
+        )
 
     def selected_model_profile_id(self, section):
         combo = (
@@ -1056,19 +1165,32 @@ class MainWindow(QMainWindow):
     def update_model_profile_ui(self, section):
         profile = get_model_profile(self.selected_model_profile_id(section))
         available, status = model_profile_status(profile.id)
-        label = (
-            self.label_training_model_status
-            if section == "training" else self.label_testing_model_status
+        combo = (
+            self.comboBox_training_model_profile
+            if section == "training" else self.comboBox_testing_model_profile
         )
-        color = "#176b3a" if available else "#9a5b00"
-        label.setText(
-            f"Готово к запуску · {profile.backend_id}"
-            if available else "Backend пока не подключен — подробности в подсказке"
-        )
-        label.setStyleSheet(f"color: {color};")
-        label.setToolTip(status)
+        combo.setToolTip(status)
+        if section == "testing" and hasattr(
+            self, "label_testing_model_status"
+        ):
+            self.label_testing_model_status.setText(
+                "Готово к запуску"
+                if available else
+                "Backend не подключен — подробности в подсказке"
+            )
+            self.label_testing_model_status.setToolTip(status)
+            self.label_testing_model_status.setProperty(
+                "backendAvailable", available
+            )
         if getattr(self, "current_section", None) == section:
             self.ui.lineEdit_model_path.setPlaceholderText(profile.default_artifact)
+        if section == "training":
+            preferred_size = "384" if profile.id == "rfdetr_nano" else "640"
+            size_index = self.ui.comboBox.findText(preferred_size)
+            if size_index >= 0:
+                self.ui.comboBox.setCurrentIndex(size_index)
+            if getattr(self, "current_section", None) == "training":
+                self.update_training_mode_ui()
 
     def require_selected_model_backend(self, section):
         profile_id = self.selected_model_profile_id(section)
@@ -1203,11 +1325,8 @@ class MainWindow(QMainWindow):
         elif section == "training":
             self.ui.groupBox_src_files.setTitle("Данные для обучения")
             self.ui.label_dataset_path.setText("Папка датасета:")
-            self.ui.label_model_path.setText("Начальная модель детекции:")
             self.update_model_profile_ui("training")
-            self.ui.label_source_hint.setText(
-                "Для обучения укажите начальную модель, корень датасета и data.yaml."
-            )
+            self.update_training_mode_ui()
         elif section == "testing":
             self.ui.groupBox_src_files.setTitle("Данные для тестирования")
             self.ui.label_model_path.setText("Обученная модель детекции:")
@@ -1451,6 +1570,24 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
+        training_process = getattr(
+            getattr(self, "yoloWorker", None), "process", None
+        )
+        if (
+            getattr(self, "active_process_kind", None) == "training"
+            and training_process is not None
+            and training_process.is_alive()
+        ):
+            if not self.ask_confirmation(
+                "Обучение выполняется",
+                "Остановить обучение и закрыть приложение?",
+                "Checkpoint последней полностью завершенной эпохи сохранится. "
+                "Текущая незавершенная эпоха будет отброшена.",
+                QMessageBox.Warning,
+            ):
+                event.ignore()
+                return
+            self.stop_training()
         self.save_current_labels()
         if (
             self.dataset_statistics_worker
@@ -1672,15 +1809,86 @@ class MainWindow(QMainWindow):
         section = getattr(self, "current_section", "training")
         if section not in ("training", "testing"):
             section = "training"
-        profile = get_model_profile(self.selected_model_profile_id(section))
+        file_filter = (
+            "Все поддерживаемые модели "
+            "(*.pt *.pth *.ckpt *.yaml *.yml *.onnx *.engine *.torchscript);;"
+            "Checkpoint RT-DETR/RF-DETR (*.pth *.ckpt);;"
+            "Модели Ultralytics (*.pt *.yaml *.yml *.onnx *.engine "
+            "*.torchscript);;Все файлы (*.*)"
+        )
+        current_text = self.ui.lineEdit_model_path.text().strip()
+        current_path = Path(current_text) if current_text else None
+        start_directory = (
+            str(current_path.parent)
+            if current_path is not None and current_path.parent.is_dir()
+            else os.getcwd()
+        )
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выберите модель детекции",
-            os.getcwd(),
-            profile.file_filter + ";;Все файлы (*)"
+            (
+                "Выберите checkpoint обучения"
+                if section == "training"
+                and self.checkBox_training_resume.isChecked()
+                else "Выберите модель детекции"
+            ),
+            start_directory,
+            file_filter,
         )
         if file_path:
+            detected_profile = infer_model_profile_from_artifact(file_path)
+            if detected_profile:
+                combo = (
+                    self.comboBox_training_model_profile
+                    if section == "training"
+                    else self.comboBox_testing_model_profile
+                )
+                index = combo.findData(detected_profile)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
             self.ui.lineEdit_model_path.setText(file_path)
+            if section == "training":
+                self.restore_training_context_from_checkpoint(file_path)
+
+    def restore_training_context_from_checkpoint(self, checkpoint_path):
+        """Восстанавливает поля формы из метаданных папки запуска marking."""
+        metadata_path = Path(checkpoint_path).parent / "Параметры_обучения.yaml"
+        if not metadata_path.is_file():
+            return
+        try:
+            metadata = yaml.safe_load(
+                metadata_path.read_text(encoding="utf-8")
+            ) or {}
+            training = metadata.get("training") or {}
+            dataset = metadata.get("dataset") or {}
+            epochs = int(training.get("epochs", 0))
+            image_size = str(training.get("image_size", ""))
+            batch_size = int(training.get("batch_size", 0))
+            patience = int(training.get("patience", 0))
+            if epochs:
+                self.ui.spinBox_epochs.setValue(epochs)
+            size_index = self.ui.comboBox.findText(image_size)
+            if size_index >= 0:
+                self.ui.comboBox.setCurrentIndex(size_index)
+            if batch_size:
+                self.ui.spinBox_batch.setValue(batch_size)
+            self.spinBox_training_patience.setValue(max(0, patience))
+            self.ui.checkBox_gpu.setChecked(bool(training.get("use_gpu", True)))
+            dataset_root = str(dataset.get("root") or "")
+            dataset_yaml = str(dataset.get("data_yaml") or "")
+            if Path(dataset_root).is_dir():
+                self.ui.lineEdit_dataset_path.setText(dataset_root)
+            if Path(dataset_yaml).is_file():
+                self.ui.lineEdit_yaml_path.setText(dataset_yaml)
+            self.checkBox_training_resume.setChecked(True)
+            self.statusBar().showMessage(
+                "Архитектура и параметры восстановлены из checkpoint",
+                6000,
+            )
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+            self.statusBar().showMessage(
+                f"Checkpoint выбран, но параметры запуска не прочитаны: {exc}",
+                8000,
+            )
 
     def choose_dataset_path(self):
         folder_path = (QFileDialog.getExistingDirectory(
@@ -2385,11 +2593,8 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка", message)
 
     def autolabling_log(self, message):
-        QMessageBox.information(
-            self,
-            "Информация",
-            message
-        )
+        """Показывает служебное событие без блокирующего всплывающего окна."""
+        self.statusBar().showMessage(message, 8000)
 
     # def on_autolabling_finished(self, success: bool):
     #     self.ui.progressBar_autolabling.setVisible(False)
@@ -2481,7 +2686,7 @@ class MainWindow(QMainWindow):
         )
 
         self.active_process_kind = "autolabel"
-        self.timer.start(100)
+        self.background_process_timer.start(100)
 
     def show_train_info(
         self, epoch, epochs_total, percent_in_epoch,
@@ -2493,26 +2698,51 @@ class MainWindow(QMainWindow):
         )
         self.ui.label_progress_value.setText(f"{percent_in_epoch} %")
         self.ui.progressBar_training.setValue(overall_percent)
+        self.statusBar().showMessage(
+            f"Обучение выполняется: эпоха {epoch} из {epochs_total}"
+        )
 
     def stop_training(self, completed=False):
-        self.timer.stop()
+        self.background_process_timer.stop()
 
         if self.yoloWorker.process and self.yoloWorker.process.is_alive():
             self.yoloWorker.process.join(timeout=2 if completed else 0)
             if self.yoloWorker.process.is_alive() and not completed:
-                self.yoloWorker.process.terminate()
-                self.yoloWorker.process.join(timeout=5)
+                self.yoloWorker.stop_process_tree()
 
         if self.active_process_kind == "training":
             self.ui.pushButton_start_training.setEnabled(True)
-            if completed:
-                self.ui.progressBar_training.setValue(100)
-                self.ui.label_progress_value.setText("100 %")
-            else:
-                self.ui.progressBar_training.setVisible(False)
+            self.pushButton_stop_training.setEnabled(False)
+            self.ui.widget.setVisible(False)
+            self.statusBar().showMessage(
+                "Обучение завершено" if completed else "Обучение остановлено",
+                8000,
+            )
         elif self.active_process_kind == "autolabel":
             self.ui.progressBar_autolabling.setVisible(False)
         self.active_process_kind = None
+
+    def request_stop_training(self):
+        if self.active_process_kind != "training":
+            return
+        if not self.ask_confirmation(
+            "Остановить обучение",
+            "Остановить обучение модели сейчас?",
+            "Checkpoint последней полностью завершенной эпохи сохранится. "
+            "Текущая незавершенная эпоха будет отброшена. Если первая эпоха "
+            "ещё не завершилась, checkpoint пока отсутствует.",
+            QMessageBox.Warning,
+        ):
+            return
+        self.pushButton_stop_training.setEnabled(False)
+        self.statusBar().showMessage("Остановка обучения…")
+        self.stop_training()
+        QMessageBox.information(
+            self,
+            "Обучение остановлено",
+            "Обучение остановлено. Для продолжения выберите checkpoint из "
+            "папки запуска и включите «Продолжить прерванное обучение»."
+        )
 
     def poll_queue(self):
         if not self.yoloWorker or not self.yoloWorker.queue:
@@ -2536,14 +2766,28 @@ class MainWindow(QMainWindow):
 
             elif msg[0] == "error":
                 _, err, tb = msg
-                QMessageBox.critical(
-                    self, "Ошибка фонового процесса", f"{err}\n\n{tb}"
-                )
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Ошибка фонового процесса")
+                dialog.setIcon(QMessageBox.Critical)
+                dialog.setText(err)
+                dialog.setDetailedText(tb)
+                dialog.addButton("Закрыть", QMessageBox.AcceptRole)
+                dialog.exec_()
                 self.stop_training()
 
             elif msg[0] == "log":
                 _, text = msg
                 self.autolabling_log(text)  # выводим лог в GUI
+
+            elif msg[0] == "training_status":
+                _, text = msg
+                self.statusBar().showMessage(text)
+                self.ui.label_epoch_number_value.setText("Подготовка…")
+                self.ui.label_gpu_mem_value.setText(
+                    "Ожидание GPU…"
+                    if self.ui.checkBox_gpu.isChecked()
+                    else "Не используется"
+                )
 
             elif msg[0] == "training_analysis":
                 self.training_analysis = msg[1]
@@ -2577,6 +2821,10 @@ class MainWindow(QMainWindow):
         details = list(analysis.get("details", []))
         if analysis.get("report_path"):
             details.extend(("", f"Отчет: {analysis['report_path']}"))
+        if analysis.get("training_parameters_path"):
+            details.append(
+                f"Параметры обучения: {analysis['training_parameters_path']}"
+            )
         if analysis.get("dataset_report_path"):
             details.append(
                 f"Статистика датасета: {analysis['dataset_report_path']}"
@@ -2589,11 +2837,44 @@ class MainWindow(QMainWindow):
         model_profile_id = self.require_selected_model_backend("training")
         if model_profile_id is None:
             return
+        profile = get_model_profile(model_profile_id)
         model_path = self.ui.lineEdit_model_path.text().strip()
-        if not os.path.exists(model_path):
+        external_backend = profile.backend_id != "ultralytics-yolo"
+        resume = self.checkBox_training_resume.isChecked()
+        if (not external_backend or resume) and not os.path.isfile(model_path):
             QMessageBox.warning(
                 self, "Не выбрана модель",
-                "Выберите файл начальной модели детекции."
+                "Выберите checkpoint прерванного обучения."
+                if resume else "Выберите файл начальной модели детекции."
+            )
+            return
+        allowed_checkpoints = {".pt"} if not external_backend else {".pth", ".pt", ".ckpt"}
+        if resume and Path(model_path).suffix.lower() not in allowed_checkpoints:
+            QMessageBox.warning(
+                self,
+                "Неверный checkpoint",
+                "Для продолжения выберите checkpoint, созданный этой архитектурой.",
+            )
+            return
+        if not external_backend and resume and Path(model_path).name.casefold() == "best.pt":
+            QMessageBox.warning(
+                self,
+                "Выбран best.pt",
+                "Для восстановления оптимизатора и номера эпохи нужен last.pt. "
+                "best.pt можно использовать только как начальные веса нового "
+                "дообучения при снятом флажке продолжения.",
+            )
+            return
+        if (
+            resume and profile.id == "rfdetr_nano"
+            and "best" in Path(model_path).name.casefold()
+        ):
+            QMessageBox.warning(
+                self,
+                "Выбран лучший вес без состояния optimizer",
+                "Для продолжения RF-DETR выберите checkpoint.pth. "
+                "checkpoint_best_total.pth предназначен для тестирования или "
+                "нового дообучения при снятом флажке продолжения.",
             )
             return
 
@@ -2616,13 +2897,21 @@ class MainWindow(QMainWindow):
         self.ui.label_gpu_mem_value.setEnabled(True)
         self.ui.label_progress.setEnabled(True)
         self.ui.label_progress_value.setEnabled(True)
-        self.ui.label_epoch_number_value.setText(f"0/{epochs}")
+        self.ui.label_epoch_number_value.setText(
+            "Восстановление…" if resume else f"0/{epochs}"
+        )
         self.ui.label_gpu_mem_value.setText("Ожидание..." if using_gpu else "Не используется")
         self.ui.label_progress_value.setText("0 %")
         self.ui.progressBar_training.setValue(0)
-        self.ui.progressBar_training.setVisible(True)
+        self.ui.widget.setVisible(True)
         self.ui.pushButton_start_training.setEnabled(False)
+        self.pushButton_stop_training.setEnabled(True)
         self.active_process_kind = "training"
+        self.statusBar().showMessage(
+            "Восстановление checkpoint…"
+            if resume else
+            "Подготовка обучения: ожидаем начало первой эпохи…"
+        )
 
         self.yoloWorker.start_training(
             model_profile_id=model_profile_id,
@@ -2631,14 +2920,16 @@ class MainWindow(QMainWindow):
             epochs=epochs,
             imgsz=int(self.ui.comboBox.currentText()),
             batch=self.ui.spinBox_batch.value(),
+            patience=self.spinBox_training_patience.value(),
             gpu=self.ui.checkBox_gpu.isChecked(),
             dataset_root=self.ui.lineEdit_dataset_path.text().strip(),
+            resume=resume,
         )
 
-        self.timer.start(100)  # 10 раз в секунду
+        self.background_process_timer.start(100)  # 10 раз в секунду
 
     def on_test_finished(self, result, report_path=""):
-        self.timer.stop()
+        self.testing_process_timer.stop()
 
         if self.yoloWorker.process:
             # Сообщение finished отправляется в самом конце процесса. Сначала
@@ -2730,9 +3021,13 @@ class MainWindow(QMainWindow):
             gpu=self.ui.checkBox_gpu_2.isChecked()
         )
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.yoloWorker.poll_queue)
-        self.timer.start(100)
+        self.testing_process_timer.stop()
+        try:
+            self.testing_process_timer.timeout.disconnect()
+        except TypeError:
+            pass
+        self.testing_process_timer.timeout.connect(self.yoloWorker.poll_queue)
+        self.testing_process_timer.start(100)
 
 
 class AddBBoxCommand(QUndoCommand):

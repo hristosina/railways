@@ -43,6 +43,27 @@ def model_test_process(
 ):
     success, report_path = False, ""
     try:
+        profile = get_model_profile(model_profile_id)
+        if profile.backend_id != "ultralytics-yolo":
+            from external_model_backend import run_external_backend
+
+            state = {}
+            success = run_external_backend(queue, "test", {
+                "profile_id": profile.id,
+                "model_display_name": profile.display_name,
+                "backend_id": profile.backend_id,
+                "model_path": model_path,
+                "scenarios": [(str(name), str(Path(path).resolve())) for name, path in scenarios],
+                "report_dir": str(Path(report_dir).resolve()),
+                "class_names": list(class_names),
+                "imgsz": int(imgsz),
+                "gpu": bool(gpu),
+            }, state)
+            report_path = state.get("report_path", "")
+            if not success:
+                raise RuntimeError(f"Backend {profile.backend_id} завершился с ошибкой.")
+            return
+
         if torch.cuda.is_available() and gpu:
             device = 0
             device_name = torch.cuda.get_device_name(device)
@@ -57,7 +78,6 @@ def model_test_process(
         report_dir = Path(report_dir).resolve()
         standard_report_dir = report_dir / "Стандартный_отчет_Ultralytics"
         queue.put(("log", f"Найдено сценариев: {len(scenarios)}"))
-        profile = get_model_profile(model_profile_id)
         queue.put(("log", f"Архитектура: {profile.display_name}; backend: {profile.backend_id}"))
         model = create_model_runtime(model_profile_id, model_path)
         model_class_names = normalize_class_names(model.names)
@@ -208,6 +228,9 @@ class ModelTestWorker(QObject):
                 self.report_created.emit(message[1])
             elif message_type == "finished":
                 self.finished.emit(message[1], message[2])
+            elif message_type == "error":
+                details = message[2] if len(message) > 2 else ""
+                self.log.emit(f"Ошибка: {message[1]}\n{details}")
 
 
 def yolo_test_process(queue, model_path, scenarios, report_dir, class_names, imgsz, gpu):

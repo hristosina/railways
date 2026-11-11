@@ -1,0 +1,165 @@
+"""Преобразование YOLO-датасета marking в COCO для официальных RT-DETR.
+
+Исходные изображения и разметка не изменяются. JSON создаются в служебной
+папке конкретного запуска, поэтому один датасет можно одновременно открывать
+в редакторе и использовать для обучения.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+from PIL import Image
+
+from dataset_statistics import (
+    IMAGE_EXTENSIONS,
+    _class_names,
+    _image_label_pairs,
+    _resolve_split_directories,
+)
+
+
+@dataclass(frozen=True)
+class CocoSplit:
+    name: str
+    images_dir: Path
+    annotations: Path
+    image_count: int
+    instance_count: int
+
+
+def load_yolo_dataset(dataset_yaml: str | Path, dataset_root: str | Path | None = None):
+    yaml_path = Path(dataset_yaml).resolve()
+    with yaml_path.open("r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    root = Path(dataset_root).resolve() if dataset_root else yaml_path.parent
+    names = _class_names(data)
+    if not names:
+        raise ValueError(f"В {yaml_path} не задан список классов names.")
+    return yaml_path, root, data, names
+
+
+def yolo_split_to_coco(
+    dataset_yaml: str | Path,
+    split: str,
+    output_json: str | Path,
+    dataset_root: str | Path | None = None,
+    category_offset: int = 1,
+) -> CocoSplit:
+    yaml_path, root, data, names = load_yolo_dataset(dataset_yaml, dataset_root)
+    directories = _resolve_split_directories(root, yaml_path, data, split)
+    if not directories:
+        aliases = "train" if split == "train" else "val/valid"
+        raise ValueError(f"Не найдена папка изображений выборки {aliases}.")
+
+    # RT-DETR принимает для одного COCO split одну общую папку изображений.
+    # В обычной структуре marking директория одна; при нескольких путях
+    # создаем JSON только если все изображения лежат в общем родителе.
+    resolved = [Path(path).resolve() for path in directories]
+    images_dir = resolved[0]
+    if len(resolved) > 1:
+        common = Path(__import__("os").path.commonpath([str(path) for path in resolved]))
+        images_dir = common
+
+    images, annotations = [], []
+    image_id = annotation_id = 0
+    seen = set()
+    for directory in resolved:
+        for image_path, label_path in _image_label_pairs(directory):
+            image_path = Path(image_path).resolve()
+            if image_path in seen or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            seen.add(image_path)
+            image_id += 1
+            with Image.open(image_path) as image:
+                width, height = image.size
+            try:
+                file_name = image_path.relative_to(images_dir).as_posix()
+            except ValueError:
+                raise ValueError(
+                    "Выборка состоит из несвязанных папок. Для RT-DETR укажите "
+                    "единый корень датасета."
+                )
+            images.append({
+                "id": image_id,
+                "file_name": file_name,
+                "width": width,
+                "height": height,
+            })
+            if not label_path or not Path(label_path).is_file():
+                continue
+            for line_number, line in enumerate(
+                Path(label_path).read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                parts = line.split()
+                if not parts:
+                    continue
+                if len(parts) != 5:
+                    raise ValueError(
+                        f"Некорректная YOLO-разметка: {label_path}, строка {line_number}."
+                    )
+                class_id = int(parts[0])
+                if not 0 <= class_id < len(names):
+                    raise ValueError(
+                        f"Неизвестный класс {class_id}: {label_path}, строка {line_number}."
+                    )
+                center_x, center_y, box_width, box_height = map(float, parts[1:])
+                x = max(0.0, (center_x - box_width / 2) * width)
+                y = max(0.0, (center_y - box_height / 2) * height)
+                w = min(float(width) - x, max(0.0, box_width * width))
+                h = min(float(height) - y, max(0.0, box_height * height))
+                if w <= 0 or h <= 0:
+                    continue
+                annotation_id += 1
+                annotations.append({
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": class_id + category_offset,
+                    "bbox": [x, y, w, h],
+                    "area": w * h,
+                    "iscrowd": 0,
+                })
+
+    if not images:
+        raise ValueError(f"В выборке {split!r} не найдено изображений.")
+    output_path = Path(output_json).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "info": {"description": "Generated by marking from YOLO annotations"},
+        "licenses": [],
+        "images": images,
+        "annotations": annotations,
+        "categories": [
+            {"id": index + category_offset, "name": name, "supercategory": "object"}
+            for index, name in enumerate(names)
+        ],
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return CocoSplit(split, images_dir, output_path, len(images), len(annotations))
+
+
+def scenario_to_coco(
+    scenario_dir: str | Path,
+    class_names: list[str],
+    output_json: str | Path,
+) -> CocoSplit:
+    """Преобразует отдельный сценарий images/labels в COCO."""
+    scenario = Path(scenario_dir).resolve()
+    temporary_yaml = Path(output_json).with_suffix(".scenario.yaml")
+    temporary_yaml.write_text(
+        yaml.safe_dump(
+            {"path": str(scenario), "train": "images", "val": "images", "names": class_names},
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        return yolo_split_to_coco(
+            temporary_yaml, "val", output_json, scenario, category_offset=1
+        )
+    finally:
+        temporary_yaml.unlink(missing_ok=True)
